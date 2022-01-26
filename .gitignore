@@ -31,11 +31,15 @@
 
 # Executables
 *.exe
+*.lz4
 *.out
 *.app
 *.i*86
 *.x86_64
 *.hex
+
+# Deko3d shaders
+*.dksh
 
 # Switch Executables
 *.nso
@@ -64,6 +68,7 @@ dkms.conf
 # Distribution files
 *.tgz
 *.zip
+*.bz2
 
 # IDA binaries
 *.id0
@@ -74,9 +79,8 @@ dkms.conf
 *.nam
 *.til
 
-# KEYS file for sept-secondary.
+# Compiled python files.
 *.pyc
-sept/sept-secondary/KEYS.py
 
 .**/
 
@@ -86,3 +90,15 @@ sept/sept-secondary/KEYS.py
 
 **/out
 **/build
+**/build_nintendo_nx_arm64
+**/build_nintendo_nx_arm64_armv8a
+**/build_nintendo_nx_arm
+**/build_nintendo_nx_arm_armv8a
+**/build_nintendo_nx_arm_armv7a
+**/build_nintendo_nx_arm_armv4t
+**/build_nintendo_nx_x64
+**/build_nintendo_nx_x86
+
+package3
+
+stratosphere/test/

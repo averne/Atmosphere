@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,138 +13,146 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <cstdlib>
-#include <cstdint>
-#include <cstring>
-#include <malloc.h>
-
-#include <switch.h>
-#include <atmosphere.h>
 #include <stratosphere.hpp>
-
-#include "fatal_types.hpp"
-#include "fatal_private.hpp"
-#include "fatal_user.hpp"
+#include "fatal_service.hpp"
 #include "fatal_config.hpp"
 #include "fatal_repair.hpp"
 #include "fatal_font.hpp"
 
+/* Set libnx graphics globals. */
 extern "C" {
-    extern u32 __start__;
-
-    u32 __nx_applet_type = AppletType_None;
-
-    #define INNER_HEAP_SIZE 0x2A0000
-    size_t nx_inner_heap_size = INNER_HEAP_SIZE;
-    char   nx_inner_heap[INNER_HEAP_SIZE];
 
     u32 __nx_nv_transfermem_size = 0x40000;
     ViLayerFlags __nx_vi_stray_layer_flags = (ViLayerFlags)0;
 
-    void __libnx_initheap(void);
-    void __appInit(void);
-    void __appExit(void);
-
-    /* Exception handling. */
-    alignas(16) u8 __nx_exception_stack[0x1000];
-    u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
-    void __libnx_exception_handler(ThreadExceptionDump *ctx);
-    void __libstratosphere_exception_handler(AtmosphereFatalErrorContext *ctx);
 }
 
-sts::ncm::TitleId __stratosphere_title_id = sts::ncm::TitleId::Fatal;
+namespace ams {
 
-void __libnx_exception_handler(ThreadExceptionDump *ctx) {
-    StratosphereCrashHandler(ctx);
-}
+    namespace fatal::srv {
 
-void __libnx_initheap(void) {
-	void*  addr = nx_inner_heap;
-	size_t size = nx_inner_heap_size;
+        namespace {
 
-	/* Newlib */
-	extern char* fake_heap_start;
-	extern char* fake_heap_end;
+            constinit u8 g_fs_heap_memory[2_KB];
+            lmem::HeapHandle g_fs_heap_handle;
 
-	fake_heap_start = (char*)addr;
-	fake_heap_end   = (char*)addr + size;
-}
+            void *AllocateForFs(size_t size) {
+                return lmem::AllocateFromExpHeap(g_fs_heap_handle, size);
+            }
 
-void __appInit(void) {
-    SetFirmwareVersionForLibnx();
+            void DeallocateForFs(void *p, size_t size) {
+                AMS_UNUSED(size);
+                return lmem::FreeToExpHeap(g_fs_heap_handle, p);
+            }
 
-    DoWithSmSession([&]() {
-        R_ASSERT(setInitialize());
-        R_ASSERT(setsysInitialize());
-        R_ASSERT(pminfoInitialize());
-        R_ASSERT(i2cInitialize());
-        R_ASSERT(bpcInitialize());
+            void InitializeFsHeap() {
+                g_fs_heap_handle = lmem::CreateExpHeap(g_fs_heap_memory, sizeof(g_fs_heap_memory), lmem::CreateOption_ThreadSafe);
+            }
 
-        if (GetRuntimeFirmwareVersion() >= FirmwareVersion_800) {
-            R_ASSERT(clkrstInitialize());
-        } else {
-            R_ASSERT(pcvInitialize());
         }
 
-        R_ASSERT(lblInitialize());
-        R_ASSERT(psmInitialize());
-        R_ASSERT(spsmInitialize());
-        R_ASSERT(plInitialize());
-        R_ASSERT(gpioInitialize());
-        R_ASSERT(fsInitialize());
-    });
+        namespace {
 
-    R_ASSERT(fsdevMountSdmc());
+            using ServerOptions = sf::hipc::DefaultServerManagerOptions;
 
-    /* fatal cannot throw fatal, so don't do: CheckAtmosphereVersion(CURRENT_ATMOSPHERE_VERSION); */
-}
+            constexpr sm::ServiceName UserServiceName = sm::ServiceName::Encode("fatal:u");
+            constexpr size_t          UserMaxSessions = 4;
 
-void __appExit(void) {
-    /* Cleanup services. */
-    fsdevUnmountAll();
-    fsExit();
-    plExit();
-    gpioExit();
-    spsmExit();
-    psmExit();
-    lblExit();
-    if (GetRuntimeFirmwareVersion() >= FirmwareVersion_800) {
-        clkrstExit();
-    } else {
-        pcvExit();
+            constexpr sm::ServiceName PrivateServiceName = sm::ServiceName::Encode("fatal:p");
+            constexpr size_t          PrivateMaxSessions = 4;
+
+            /* fatal:u, fatal:p. */
+            constexpr size_t NumServers  = 2;
+            constexpr size_t NumSessions = UserMaxSessions + PrivateMaxSessions;
+
+            sf::hipc::ServerManager<NumServers, ServerOptions, NumSessions> g_server_manager;
+
+            constinit sf::UnmanagedServiceObject<fatal::impl::IService, fatal::srv::Service> g_user_service_object;
+            constinit sf::UnmanagedServiceObject<fatal::impl::IPrivateService, fatal::srv::Service> g_private_service_object;
+
+            void InitializeAndLoopIpcServer() {
+                /* Create services. */
+                R_ABORT_UNLESS(g_server_manager.RegisterObjectForServer(g_user_service_object.GetShared(),    UserServiceName, UserMaxSessions));
+                R_ABORT_UNLESS(g_server_manager.RegisterObjectForServer(g_private_service_object.GetShared(), PrivateServiceName, PrivateMaxSessions));
+
+                /* Add dirty event holder. */
+                auto *dirty_event_holder = fatal::srv::GetFatalDirtyMultiWaitHolder();
+                g_server_manager.AddUserMultiWaitHolder(dirty_event_holder);
+
+                /* Loop forever, servicing our services. */
+                /* Because fatal has a user wait holder, we need to specify how to process manually. */
+                while (auto *signaled_holder = g_server_manager.WaitSignaled()) {
+                    if (signaled_holder == dirty_event_holder) {
+                        /* Dirty event holder was signaled. */
+                        fatal::srv::OnFatalDirtyEvent();
+                        g_server_manager.AddUserMultiWaitHolder(signaled_holder);
+                    } else {
+                        /* A server/session was signaled. Have the manager handle it. */
+                        R_ABORT_UNLESS(g_server_manager.Process(signaled_holder));
+                    }
+                }
+            }
+
+        }
+
     }
-    bpcExit();
-    i2cExit();
-    pminfoExit();
-    setsysExit();
-    setExit();
-}
 
-int main(int argc, char **argv)
-{
-    /* Load settings from set:sys. */
-    InitializeFatalConfig();
+    namespace init {
 
-    /* Load shared font. */
-    if (R_FAILED(FontManager::InitializeSharedFont())) {
-        std::abort();
+        void InitializeSystemModule() {
+            /* Initialize heap. */
+            fatal::srv::InitializeFsHeap();
+
+            /* Initialize our connection to sm. */
+            R_ABORT_UNLESS(sm::Initialize());
+
+            /* Initialize fs. */
+            fs::InitializeForSystem();
+            fs::SetAllocator(fatal::srv::AllocateForFs, fatal::srv::DeallocateForFs);
+            fs::SetEnabledAutoAbort(false);
+
+            /* Initialize other services we need. */
+            R_ABORT_UNLESS(setInitialize());
+            R_ABORT_UNLESS(setsysInitialize());
+            R_ABORT_UNLESS(pminfoInitialize());
+            R_ABORT_UNLESS(i2cInitialize());
+            R_ABORT_UNLESS(bpcInitialize());
+
+            if (hos::GetVersion() >= hos::Version_8_0_0) {
+                R_ABORT_UNLESS(clkrstInitialize());
+            } else {
+                R_ABORT_UNLESS(pcvInitialize());
+            }
+
+            R_ABORT_UNLESS(lblInitialize());
+            R_ABORT_UNLESS(psmInitialize());
+            R_ABORT_UNLESS(spsmInitialize());
+            R_ABORT_UNLESS(plInitialize(::PlServiceType_User));
+            gpio::Initialize();
+
+            /* Mount the SD card. */
+            R_ABORT_UNLESS(fs::MountSdCard("sdmc"));
+        }
+
+        void FinalizeSystemModule() { /* ... */ }
+
+        void Startup() { /* ... */ }
+
     }
 
-    /* Check whether we should throw fatal due to repair process. */
-    CheckRepairStatus();
+    void Main() {
+        /* Set thread name. */
+        os::SetThreadNamePointer(os::GetCurrentThread(), AMS_GET_SYSTEM_THREAD_NAME(fatal, Main));
+        AMS_ASSERT(os::GetThreadPriority(os::GetCurrentThread()) == AMS_GET_SYSTEM_THREAD_PRIORITY(fatal, Main));
 
-    /* TODO: What's a good timeout value to use here? */
-    static auto s_server_manager = WaitableManager(1);
+        /* Load shared font. */
+        R_ABORT_UNLESS(fatal::srv::font::InitializeSharedFont());
 
-    /* Create services. */
-    s_server_manager.AddWaitable(new ServiceServer<PrivateService>("fatal:p", 4));
-    s_server_manager.AddWaitable(new ServiceServer<UserService>("fatal:u", 4));
-    s_server_manager.AddWaitable(GetFatalSettingsEvent());
+        /* Check whether we should throw fatal due to repair process. */
+        fatal::srv::CheckRepairStatus();
 
-    /* Loop forever, servicing our services. */
-    s_server_manager.Process();
+        /* Loop processing the IPC server. */
+        fatal::srv::InitializeAndLoopIpcServer();
+    }
 
-    return 0;
 }
-

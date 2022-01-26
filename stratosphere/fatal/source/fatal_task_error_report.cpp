@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,137 +13,166 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <cstdio>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <switch.h>
-#include <atmosphere/version.h>
-
-#include "fatal_task_error_report.hpp"
+#include <stratosphere.hpp>
 #include "fatal_config.hpp"
+#include "fatal_task_error_report.hpp"
+#include "fatal_scoped_file.hpp"
 
-void ErrorReportTask::EnsureReportDirectories() {
-    char path[FS_MAX_PATH];
-    strcpy(path, "sdmc:/atmosphere");
-    mkdir(path, S_IRWXU);
-    strcat(path, "/fatal_reports");
-    mkdir(path, S_IRWXU);
-    strcat(path, "/dumps");
-    mkdir(path, S_IRWXU);
-}
+namespace ams::fatal::srv {
 
-bool ErrorReportTask::GetCurrentTime(u64 *out) {
-    *out = 0;
+    namespace {
 
-    /* Verify that pcv isn't dead. */
-    {
-        bool has_time_service;
-        DoWithSmSession([&]() {
-            Handle dummy;
-            if (R_SUCCEEDED(smRegisterService(&dummy, "time:s", false, 0x20))) {
-                svcCloseHandle(dummy);
-                has_time_service = false;
-            } else {
-                has_time_service = true;
-            }
-        });
-        if (!has_time_service) {
-            return false;
+        /* Helpers. */
+        void TryEnsureReportDirectories() {
+            fs::EnsureDirectoryRecursively("sdmc:/atmosphere/fatal_reports/dumps");
         }
-    }
 
-    /* Try to get the current time. */
-    bool success = true;
-    DoWithSmSession([&]() {
-        success &= R_SUCCEEDED(timeInitialize());
-    });
-    if (success) {
-        success &= R_SUCCEEDED(timeGetCurrentTime(TimeType_LocalSystemClock, out));
-        timeExit();
-    }
-    return success;
-}
+        bool TryGetCurrentTimestamp(u64 *out) {
+            /* Clear output. */
+            *out = 0;
 
-void ErrorReportTask::SaveReportToSdCard() {
-    char file_path[FS_MAX_PATH];
-
-    /* Ensure path exists. */
-    EnsureReportDirectories();
-
-    /* Get a timestamp. */
-    u64 timestamp;
-    if (!GetCurrentTime(&timestamp)) {
-        timestamp = svcGetSystemTick();
-    }
-
-    /* Open report file. */
-    snprintf(file_path, sizeof(file_path) - 1, "sdmc:/atmosphere/fatal_reports/%011lu_%016lx.log", timestamp, this->title_id);
-    FILE *f_report = fopen(file_path, "w");
-    if (f_report != NULL) {
-        ON_SCOPE_EXIT { fclose(f_report); };
-
-        fprintf(f_report, "Atmosphère Fatal Report (v1.0):\n");
-        fprintf(f_report, "Result:                          0x%X (2%03d-%04d)\n\n", this->ctx->error_code, R_MODULE(this->ctx->error_code), R_DESCRIPTION(this->ctx->error_code));
-        fprintf(f_report, "Title ID:                        %016lx\n", this->title_id);
-        if (strlen(this->ctx->proc_name)) {
-            fprintf(f_report, "Process Name:                    %s\n", this->ctx->proc_name);
-        }
-        fprintf(f_report, u8"Firmware:                        %s (Atmosphère %u.%u.%u-%s)\n", GetFatalConfig()->firmware_version.display_version, CURRENT_ATMOSPHERE_VERSION, GetAtmosphereGitRevision());
-
-        if (this->ctx->cpu_ctx.is_aarch32) {
-            fprintf(f_report, "General Purpose Registers:\n");
-            for (size_t i = 0; i < NumAarch32Gprs; i++) {
-                if (this->ctx->has_gprs[i]) {
-                    fprintf(f_report,  "        %3s:                     %08x\n", Aarch32GprNames[i], this->ctx->cpu_ctx.aarch32_ctx.r[i]);
+            /* Check if we have time service. */
+            {
+                bool has_time_service = false;
+                if (R_FAILED(sm::HasService(std::addressof(has_time_service), sm::ServiceName::Encode("time:s"))) || !has_time_service) {
+                    return false;
                 }
             }
-            fprintf(f_report, "    PC:                          %08x\n", this->ctx->cpu_ctx.aarch32_ctx.pc);
-            fprintf(f_report, "Start Address:                   %08x\n", this->ctx->cpu_ctx.aarch32_ctx.start_address);
-            fprintf(f_report, "Stack Trace:\n");
-            for (unsigned int i = 0; i < this->ctx->cpu_ctx.aarch32_ctx.stack_trace_size; i++) {
-                fprintf(f_report, "        ReturnAddress[%02u]:       %08x\n", i, this->ctx->cpu_ctx.aarch32_ctx.stack_trace[i]);
+
+            /* Try to get the current time. */
+            {
+                if (R_FAILED(::timeInitialize())) {
+                    return false;
+                }
+                ON_SCOPE_EXIT { ::timeExit(); };
+
+                return R_SUCCEEDED(::timeGetCurrentTime(TimeType_LocalSystemClock, out));
             }
-        } else {
-            fprintf(f_report, "General Purpose Registers:\n");
-            for (size_t i = 0; i < NumAarch64Gprs; i++) {
-                if (this->ctx->has_gprs[i]) {
-                    fprintf(f_report,  "        %3s:                     %016lx\n", Aarch64GprNames[i], this->ctx->cpu_ctx.aarch64_ctx.x[i]);
+        }
+
+        /* Task definition. */
+        class ErrorReportTask : public ITaskWithDefaultStack {
+            private:
+                void SaveReportToSdCard();
+            public:
+                virtual Result Run() override;
+                virtual const char *GetName() const override {
+                    return "WriteErrorReport";
+                }
+        };
+
+        /* Task globals. */
+        ErrorReportTask g_error_report_task;
+
+        /* Task Implementation. */
+        void ErrorReportTask::SaveReportToSdCard() {
+            char file_path[fs::EntryNameLengthMax + 1];
+
+            /* Try to Ensure path exists. */
+            TryEnsureReportDirectories();
+
+            /* Get a timestamp. */
+            u64 timestamp;
+            if (!TryGetCurrentTimestamp(std::addressof(timestamp))) {
+                timestamp = os::GetSystemTick().GetInt64Value();
+            }
+
+            /* Open report file. */
+            {
+                util::SNPrintf(file_path, sizeof(file_path) - 1, "sdmc:/atmosphere/fatal_reports/%011lu_%016lx.log", timestamp, static_cast<u64>(m_context->program_id));
+                ScopedFile file(file_path);
+                if (file.IsOpen()) {
+                    file.WriteFormat("Atmosphère Fatal Report (v1.1):\n");
+                    file.WriteFormat("Result:                          0x%X (2%03d-%04d)\n\n", m_context->result.GetValue(), m_context->result.GetModule(), m_context->result.GetDescription());
+                    file.WriteFormat("Program ID:                      %016lx\n", static_cast<u64>(m_context->program_id));
+                    if (strlen(m_context->proc_name)) {
+                        file.WriteFormat("Process Name:                    %s\n", m_context->proc_name);
+                    }
+                    file.WriteFormat("Firmware:                        %s (Atmosphère %u.%u.%u-%s)\n", GetFatalConfig().GetFirmwareVersion().display_version, ATMOSPHERE_RELEASE_VERSION, ams::GetGitRevision());
+
+                    if (m_context->cpu_ctx.architecture == CpuContext::Architecture_Aarch32) {
+                        file.WriteFormat("General Purpose Registers:\n");
+                        for (size_t i = 0; i <= aarch32::RegisterName_PC; i++) {
+                            if (m_context->cpu_ctx.aarch32_ctx.HasRegisterValue(static_cast<aarch32::RegisterName>(i))) {
+                                file.WriteFormat( "        %3s:                     %08x\n", aarch32::CpuContext::RegisterNameStrings[i], m_context->cpu_ctx.aarch32_ctx.r[i]);
+                            }
+                        }
+                        file.WriteFormat("Start Address:                   %08x\n", m_context->cpu_ctx.aarch32_ctx.base_address);
+                        file.WriteFormat("Stack Trace:\n");
+                        for (unsigned int i = 0; i < m_context->cpu_ctx.aarch32_ctx.stack_trace_size; i++) {
+                            file.WriteFormat("        ReturnAddress[%02u]:       %08x\n", i, m_context->cpu_ctx.aarch32_ctx.stack_trace[i]);
+                        }
+                    } else {
+                        file.WriteFormat("General Purpose Registers:\n");
+                        for (size_t i = 0; i <= aarch64::RegisterName_PC; i++) {
+                            if (m_context->cpu_ctx.aarch64_ctx.HasRegisterValue(static_cast<aarch64::RegisterName>(i))) {
+                                file.WriteFormat( "        %3s:                     %016lx\n", aarch64::CpuContext::RegisterNameStrings[i], m_context->cpu_ctx.aarch64_ctx.x[i]);
+                            }
+                        }
+                        file.WriteFormat("Start Address:                   %016lx\n", m_context->cpu_ctx.aarch64_ctx.base_address);
+                        file.WriteFormat("Stack Trace:\n");
+                        for (unsigned int i = 0; i < m_context->cpu_ctx.aarch64_ctx.stack_trace_size; i++) {
+                            file.WriteFormat("        ReturnAddress[%02u]:       %016lx\n", i, m_context->cpu_ctx.aarch64_ctx.stack_trace[i]);
+                        }
+                    }
+
+                    if (m_context->stack_dump_size != 0) {
+                        file.WriteFormat("Stack Dump:                               00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n");
+                        for (size_t i = 0; i < 0x10; i++) {
+                            const size_t ofs = i * 0x10;
+                            file.WriteFormat("                             %012lx %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                m_context->stack_dump_base + ofs, m_context->stack_dump[ofs + 0], m_context->stack_dump[ofs + 1], m_context->stack_dump[ofs + 2], m_context->stack_dump[ofs + 3], m_context->stack_dump[ofs + 4], m_context->stack_dump[ofs + 5], m_context->stack_dump[ofs + 6], m_context->stack_dump[ofs + 7],
+                                m_context->stack_dump[ofs + 8], m_context->stack_dump[ofs + 9], m_context->stack_dump[ofs + 10], m_context->stack_dump[ofs + 11], m_context->stack_dump[ofs + 12], m_context->stack_dump[ofs + 13], m_context->stack_dump[ofs + 14], m_context->stack_dump[ofs + 15]);
+                        }
+                    }
+
+                    if (m_context->tls_address != 0) {
+                        file.WriteFormat("TLS Address:                 %016lx\n", m_context->tls_address);
+                        file.WriteFormat("TLS Dump:                                 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n");
+                        for (size_t i = 0; i < 0x10; i++) {
+                            const size_t ofs = i * 0x10;
+                            file.WriteFormat("                             %012lx %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                m_context->tls_address + ofs, m_context->tls_dump[ofs + 0], m_context->tls_dump[ofs + 1], m_context->tls_dump[ofs + 2], m_context->tls_dump[ofs + 3], m_context->tls_dump[ofs + 4], m_context->tls_dump[ofs + 5], m_context->tls_dump[ofs + 6], m_context->tls_dump[ofs + 7],
+                                m_context->tls_dump[ofs + 8], m_context->tls_dump[ofs + 9], m_context->tls_dump[ofs + 10], m_context->tls_dump[ofs + 11], m_context->tls_dump[ofs + 12], m_context->tls_dump[ofs + 13], m_context->tls_dump[ofs + 14], m_context->tls_dump[ofs + 15]);
+                        }
+                    }
                 }
             }
-            fprintf(f_report, "    PC:                          %016lx\n", this->ctx->cpu_ctx.aarch64_ctx.pc);
-            fprintf(f_report, "Start Address:                   %016lx\n", this->ctx->cpu_ctx.aarch64_ctx.start_address);
-            fprintf(f_report, "Stack Trace:\n");
-            for (unsigned int i = 0; i < this->ctx->cpu_ctx.aarch64_ctx.stack_trace_size; i++) {
-                fprintf(f_report, "        ReturnAddress[%02u]:       %016lx\n", i, this->ctx->cpu_ctx.aarch64_ctx.stack_trace[i]);
+
+            /* Dump data to file. */
+            {
+                util::SNPrintf(file_path, sizeof(file_path) - 1, "sdmc:/atmosphere/fatal_reports/dumps/%011lu_%016lx.bin", timestamp, static_cast<u64>(m_context->program_id));
+                ScopedFile file(file_path);
+                if (file.IsOpen()) {
+                    file.Write(m_context->tls_dump, sizeof(m_context->tls_dump));
+                    if (m_context->stack_dump_size) {
+                        file.Write(m_context->stack_dump, m_context->stack_dump_size);
+                    }
+                }
             }
+        }
+
+        Result ErrorReportTask::Run() {
+            if (m_context->generate_error_report) {
+                /* Here, Nintendo creates an error report with erpt. AMS will not do that. */
+            }
+
+            /* Save report to SD card. */
+            if (!m_context->is_creport) {
+                this->SaveReportToSdCard();
+            }
+
+            /* Signal we're done with our job. */
+            m_context->erpt_event->Signal();
+
+            return ResultSuccess();
         }
 
     }
 
-    if (this->ctx->stack_dump_size) {
-        snprintf(file_path, sizeof(file_path) - 1, "sdmc:/atmosphere/fatal_reports/dumps/%011lu_%016lx.bin", timestamp, this->title_id);
-        FILE *f_stackdump = fopen(file_path, "wb");
-        if (f_stackdump == NULL) { return; }
-        ON_SCOPE_EXIT { fclose(f_stackdump); };
-
-        fwrite(this->ctx->stack_dump, this->ctx->stack_dump_size, 1, f_stackdump);
-    }
-}
-
-Result ErrorReportTask::Run() {
-    if (this->create_report) {
-        /* Here, Nintendo creates an error report with erpt. AMS will not do that. */
+    ITask *GetErrorReportTask(const ThrowContext *ctx) {
+        g_error_report_task.Initialize(ctx);
+        return std::addressof(g_error_report_task);
     }
 
-    /* Save report to SD card. */
-    if (!this->ctx->is_creport) {
-        SaveReportToSdCard();
-    }
-
-    /* Signal we're done with our job. */
-    eventFire(this->erpt_event);
-
-
-    return ResultSuccess;
 }

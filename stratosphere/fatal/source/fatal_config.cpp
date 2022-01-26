@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,79 +13,114 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <switch.h>
-#include "fatal_types.hpp"
+#include <stratosphere.hpp>
 #include "fatal_config.hpp"
 
-static FatalConfig g_fatal_config = {};
+namespace ams::fatal::srv {
 
-static IEvent *g_fatal_settings_event = nullptr;
+    namespace {
 
-FatalConfig *GetFatalConfig() {
-    return &g_fatal_config;
-}
+        /* Global config. */
+        constinit os::SdkMutex g_config_mutex;
+        constinit bool g_initialized_config;
+        constinit util::TypedStorage<FatalConfig> g_config;
 
-static void UpdateLanguageCode() {
-    setGetLanguageCode(&GetFatalConfig()->language_code);
-}
+        FatalConfig &GetFatalConfigImpl() {
+            if (AMS_UNLIKELY(!g_initialized_config)) {
+                std::scoped_lock lk(g_config_mutex);
 
-IEvent *GetFatalSettingsEvent() {
-    if (g_fatal_settings_event == nullptr) {
-        Event evt;
-        if (R_FAILED(setsysBindFatalDirtyFlagEvent(&evt))) {
-            std::abort();
-        }
-        g_fatal_settings_event = LoadReadOnlySystemEvent(evt.revent, [](u64 timeout) {
-            u64 flags_0, flags_1;
-            if (R_SUCCEEDED(setsysGetFatalDirtyFlags(&flags_0, &flags_1)) && (flags_0 & 1)) {
-                UpdateLanguageCode();
+                if (AMS_LIKELY(!g_initialized_config)) {
+                    util::ConstructAt(g_config);
+
+                    g_initialized_config = true;
+                }
             }
-            return ResultSuccess;
-        }, true);
+
+            return util::GetReference(g_config);
+        }
+
+
+        /* Event creator. */
+        os::NativeHandle GetFatalDirtyEventReadableHandle() {
+            Event evt;
+            R_ABORT_UNLESS(setsysAcquireFatalDirtyFlagEventHandle(std::addressof(evt)));
+            return evt.revent;
+        }
+
+        /* Global event. */
+        constinit os::SystemEventType g_fatal_dirty_event;
+        constinit os::MultiWaitHolderType g_fatal_dirty_multi_wait_holder;
+        constinit bool g_initialized_fatal_dirty_event;
+
     }
 
-    return g_fatal_settings_event;
-}
-
-static void SetupConfigLanguages() {
-    FatalConfig *config = GetFatalConfig();
-
-    /* Defaults. */
-    config->error_msg   = u8"Error Code: 2%03d-%04d (0x%x)\n";
-
-    if (config->quest_flag) {
-        config->error_desc = u8"Please call 1-800-875-1852 for service.\n";
-    } else {
-        config->error_desc = u8"An error has occured.\n\n"
-                             u8"Please press the POWER Button to restart the console normally, or a VOL button\n"
-                             u8"to reboot to a payload (or RCM, if none is present). If you are unable to\n"
-                             u8"restart the console, hold the POWER Button for 12 seconds to turn the console off.\n\n"
-                             u8"If the problem persists, refer to the Nintendo Support Website.\n"
-                             u8"support.nintendo.com/switch/error\n";
+    os::MultiWaitHolderType *GetFatalDirtyMultiWaitHolder() {
+        if (AMS_UNLIKELY(!g_initialized_fatal_dirty_event)) {
+            os::AttachReadableHandleToSystemEvent(std::addressof(g_fatal_dirty_event), GetFatalDirtyEventReadableHandle(), true, os::EventClearMode_ManualClear);
+            os::InitializeMultiWaitHolder(std::addressof(g_fatal_dirty_multi_wait_holder), std::addressof(g_fatal_dirty_event));
+            os::SetMultiWaitHolderUserData(std::addressof(g_fatal_dirty_multi_wait_holder), reinterpret_cast<uintptr_t>(std::addressof(g_fatal_dirty_multi_wait_holder)));
+            g_initialized_fatal_dirty_event = true;
+        }
+        return std::addressof(g_fatal_dirty_multi_wait_holder);
     }
 
-    /* TODO: Try to load dynamically. */
-    /* FsStorage message_storage; */
-    /* TODO: if (R_SUCCEEDED(fsOpenDataStorageByDataId(0x010000000000081D, "fatal_msg"))) { ... } */
-}
+    void OnFatalDirtyEvent() {
+        os::ClearSystemEvent(std::addressof(g_fatal_dirty_event));
 
-void InitializeFatalConfig() {
-    FatalConfig *config = GetFatalConfig();
+        u64 flags_0, flags_1;
+        if (R_SUCCEEDED(setsysGetFatalDirtyFlags(std::addressof(flags_0), std::addressof(flags_1))) && (flags_0 & 1)) {
+            GetFatalConfigImpl().UpdateLanguageCode();
+        }
+    }
 
-    memset(config, 0, sizeof(*config));
-    setsysGetSerialNumber(config->serial_number);
-    setsysGetFirmwareVersion(&config->firmware_version);
-    UpdateLanguageCode();
+    FatalConfig::FatalConfig() {
+        /* Get information from set. */
+        settings::system::GetSerialNumber(std::addressof(m_serial_number));
+        settings::system::GetFirmwareVersion(std::addressof(m_firmware_version));
+        setsysGetQuestFlag(std::addressof(m_quest_flag));
+        this->UpdateLanguageCode();
 
-    setsysGetSettingsItemValue("fatal", "transition_to_fatal", &config->transition_to_fatal, sizeof(config->transition_to_fatal));
-    setsysGetSettingsItemValue("fatal", "show_extra_info", &config->show_extra_info, sizeof(config->show_extra_info));
-    setsysGetSettingsItemValue("fatal", "quest_reboot_interval_second", &config->quest_reboot_interval_second, sizeof(config->quest_reboot_interval_second));
+        /* Read information from settings. */
+        settings::fwdbg::GetSettingsItemValue(std::addressof(m_transition_to_fatal), sizeof(m_transition_to_fatal), "fatal", "transition_to_fatal");
+        settings::fwdbg::GetSettingsItemValue(std::addressof(m_show_extra_info), sizeof(m_show_extra_info), "fatal", "show_extra_info");
 
-    setsysGetFlag(SetSysFlag_Quest, &config->quest_flag);
+        u64 quest_interval_second;
+        settings::fwdbg::GetSettingsItemValue(std::addressof(quest_interval_second), sizeof(quest_interval_second), "fatal", "quest_reboot_interval_second");
+        m_quest_reboot_interval = TimeSpan::FromSeconds(quest_interval_second);
 
-    config->is_auto_reboot_enabled = R_SUCCEEDED(setsysGetSettingsItemValue("atmosphere", "fatal_auto_reboot_interval", &config->fatal_auto_reboot_interval, sizeof(config->fatal_auto_reboot_interval)));
-    config->is_auto_reboot_enabled &= (config->fatal_auto_reboot_interval != 0);
+        /* Atmosphere extension for automatic reboot. */
+        u64 auto_reboot_ms;
+        if (settings::fwdbg::GetSettingsItemValue(std::addressof(auto_reboot_ms), sizeof(auto_reboot_ms), "atmosphere", "fatal_auto_reboot_interval") == sizeof(auto_reboot_ms)) {
+            m_fatal_auto_reboot_interval = TimeSpan::FromMilliSeconds(auto_reboot_ms);
+            m_fatal_auto_reboot_enabled  = auto_reboot_ms != 0;
+        }
 
-    SetupConfigLanguages();
+        /* Setup messages. */
+        {
+            m_error_msg = "Error Code: 2%03d-%04d (0x%x)\n";
+
+            m_error_desc = "An error has occurred.\n\n"
+                           "Please press the POWER Button to restart the console normally, or a VOL button\n"
+                           "to reboot to a payload (or RCM, if none is present). If you are unable to\n"
+                           "restart the console, hold the POWER Button for 12 seconds to turn the console off.\n\n"
+                           "If the problem persists, refer to the Nintendo Support Website.\n"
+                           "support.nintendo.com/switch/error\n";
+
+            /* If you're running Atmosphere on a quest unit for some reason, talk to me on discord. */
+            m_quest_desc = "Please call 1-800-875-1852 for service.\n\n"
+                           "Also, please be aware that running Atmosphere on a Quest device is not fully\n"
+                           "supported. Perhaps try booting your device without Atmosphere before calling\n"
+                           "an official Nintendo service hotline. If you encounter further issues, please\n"
+                           "contact SciresM#0524 on Discord, or via some other means.\n";
+
+            /* TODO: Try to load dynamically? */
+            /* FsStorage message_storage; */
+            /* TODO: if (R_SUCCEEDED(fsOpenDataStorageByDataId(0x010000000000081D, "fatal_msg"))) { ... } */
+        }
+    }
+
+    const FatalConfig &GetFatalConfig() {
+        return GetFatalConfigImpl();
+    }
+
 }

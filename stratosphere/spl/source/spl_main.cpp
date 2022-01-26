@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,16 +13,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <cstdlib>
-#include <cstdint>
-#include <cstring>
-#include <malloc.h>
-
-#include <switch.h>
 #include <stratosphere.hpp>
-
-#include "spl_api_impl.hpp"
 
 #include "spl_random_service.hpp"
 #include "spl_general_service.hpp"
@@ -34,86 +25,168 @@
 
 #include "spl_deprecated_service.hpp"
 
-extern "C" {
-    extern u32 __start__;
+namespace ams {
 
-    u32 __nx_applet_type = AppletType_None;
+    namespace spl {
 
-    #define INNER_HEAP_SIZE 0x28000
-    size_t nx_inner_heap_size = INNER_HEAP_SIZE;
-    char   nx_inner_heap[INNER_HEAP_SIZE];
+        namespace {
 
-    void __libnx_initheap(void);
-    void __appInit(void);
-    void __appExit(void);
+            struct SplServerOptions {
+                static constexpr size_t PointerBufferSize   = 0x800;
+                static constexpr size_t MaxDomains          = 0;
+                static constexpr size_t MaxDomainObjects    = 0;
+                static constexpr bool CanDeferInvokeRequest = false;
+                static constexpr bool CanManageMitmServers  = false;
+            };
 
-    /* Exception handling. */
-    alignas(16) u8 __nx_exception_stack[0x1000];
-    u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
-    void __libnx_exception_handler(ThreadExceptionDump *ctx);
-    void __libstratosphere_exception_handler(AtmosphereFatalErrorContext *ctx);
-}
+            enum PortIndex {
+                PortIndex_General,
+                PortIndex_Random,
+                PortIndex_Crypto,
+                PortIndex_Fs,
+                PortIndex_Ssl,
+                PortIndex_Es,
+                PortIndex_Manu,
+                PortIndex_Count,
+            };
 
-sts::ncm::TitleId __stratosphere_title_id = sts::ncm::TitleId::Spl;
+            constexpr sm::ServiceName RandomServiceName = sm::ServiceName::Encode("csrng");
+            constexpr size_t          RandomMaxSessions = 3;
 
-void __libnx_exception_handler(ThreadExceptionDump *ctx) {
-    StratosphereCrashHandler(ctx);
-}
+            constexpr sm::ServiceName GeneralServiceName = sm::ServiceName::Encode("spl:");
+            constexpr size_t          DeprecatedMaxSessions = 13;
+            constexpr size_t          GeneralMaxSessions = 7;
 
+            constexpr sm::ServiceName CryptoServiceName = sm::ServiceName::Encode("spl:mig");
+            constexpr size_t          CryptoMaxSessions = 7;
 
-void __libnx_initheap(void) {
-    void*  addr = nx_inner_heap;
-    size_t size = nx_inner_heap_size;
+            constexpr sm::ServiceName SslServiceName = sm::ServiceName::Encode("spl:ssl");
+            constexpr size_t          SslMaxSessions = 2;
 
-    /* Newlib */
-    extern char* fake_heap_start;
-    extern char* fake_heap_end;
+            constexpr sm::ServiceName EsServiceName = sm::ServiceName::Encode("spl:es");
+            constexpr size_t          EsMaxSessions = 2;
 
-    fake_heap_start = (char*)addr;
-    fake_heap_end   = (char*)addr + size;
-}
+            constexpr sm::ServiceName FsServiceName = sm::ServiceName::Encode("spl:fs");
+            constexpr size_t          FsMaxSessions = 3;
 
-void __appInit(void) {
-    SetFirmwareVersionForLibnx();
+            constexpr sm::ServiceName ManuServiceName = sm::ServiceName::Encode("spl:manu");
+            constexpr size_t          ManuMaxSessions = 1;
 
-    /* SPL doesn't really access any services... */
-}
+            /* csrng, spl:, spl:mig, spl:ssl, spl:es, spl:fs, spl:manu. */
+            /* TODO: Consider max sessions enforcement? */
+            constexpr size_t ModernMaxSessions = GeneralMaxSessions + CryptoMaxSessions + SslMaxSessions + EsMaxSessions + FsMaxSessions + ManuMaxSessions;
+            constexpr size_t NumSessions = RandomMaxSessions + std::max(DeprecatedMaxSessions, ModernMaxSessions) + 1;
 
-void __appExit(void) {
-    /* SPL doesn't really access any services... */
-}
+            class ServerManager final : public sf::hipc::ServerManager<PortIndex_Count, SplServerOptions, NumSessions> {
+                private:
+                    sf::ExpHeapAllocator *m_allocator;
+                    spl::SecureMonitorManager *m_secure_monitor_manager;
+                    spl::GeneralService m_general_service;
+                    sf::UnmanagedServiceObjectByPointer<spl::impl::IGeneralInterface, spl::GeneralService> m_general_service_object;
+                    spl::RandomService m_random_service;
+                    sf::UnmanagedServiceObjectByPointer<spl::impl::IRandomInterface, spl::RandomService> m_random_service_object;
+                public:
+                    ServerManager(sf::ExpHeapAllocator *allocator, spl::SecureMonitorManager *manager) : m_allocator(allocator), m_secure_monitor_manager(manager), m_general_service(manager), m_general_service_object(std::addressof(m_general_service)), m_random_service(manager), m_random_service_object(std::addressof(m_random_service)) {
+                        /* ... */
+                    }
+                private:
+                    virtual ams::Result OnNeedsToAccept(int port_index, Server *server) override;
+            };
 
-struct SplServerOptions {
-    static constexpr size_t PointerBufferSize = 0x800;
-    static constexpr size_t MaxDomains = 0;
-    static constexpr size_t MaxDomainObjects = 0;
-};
+            using Allocator     = sf::ExpHeapAllocator;
+            using ObjectFactory = sf::ObjectFactory<sf::ExpHeapAllocator::Policy>;
 
-int main(int argc, char **argv)
-{
-    /* Initialize global context. */
-    sts::spl::impl::Initialize();
+            alignas(0x40) constinit u8 g_server_allocator_buffer[8_KB];
+            Allocator g_server_allocator;
+            constinit SecureMonitorManager g_secure_monitor_manager;
 
-    /* Create server manager. */
-    static auto s_server_manager = WaitableManager<SplServerOptions>(1);
+            constinit bool g_use_new_server = false;
 
-    /* Create services. */
-    s_server_manager.AddWaitable(new ServiceServer<sts::spl::RandomService>("csrng", 3));
-    if (GetRuntimeFirmwareVersion() >= FirmwareVersion_400) {
-        s_server_manager.AddWaitable(new ServiceServer<sts::spl::GeneralService>("spl:", 9));
-        s_server_manager.AddWaitable(new ServiceServer<sts::spl::CryptoService>("spl:mig", 6));
-        s_server_manager.AddWaitable(new ServiceServer<sts::spl::SslService>("spl:ssl", 2));
-        s_server_manager.AddWaitable(new ServiceServer<sts::spl::EsService>("spl:es", 2));
-        s_server_manager.AddWaitable(new ServiceServer<sts::spl::FsService>("spl:fs", 2));
-        if (GetRuntimeFirmwareVersion() >= FirmwareVersion_500) {
-            s_server_manager.AddWaitable(new ServiceServer<sts::spl::ManuService>("spl:manu", 1));
+            ServerManager g_server_manager(std::addressof(g_server_allocator), std::addressof(g_secure_monitor_manager));
+
+            ams::Result ServerManager::OnNeedsToAccept(int port_index, Server *server) {
+                switch (port_index) {
+                    case PortIndex_General:
+                        if (g_use_new_server) {
+                            return this->AcceptImpl(server, m_general_service_object.GetShared());
+                        } else {
+                            return this->AcceptImpl(server, ObjectFactory::CreateSharedEmplaced<spl::impl::IDeprecatedGeneralInterface, spl::DeprecatedService>(m_allocator, m_secure_monitor_manager));
+                        }
+                    case PortIndex_Random:
+                        return this->AcceptImpl(server, m_random_service_object.GetShared());
+                    case PortIndex_Crypto:
+                        return this->AcceptImpl(server, ObjectFactory::CreateSharedEmplaced<spl::impl::ICryptoInterface, spl::CryptoService>(m_allocator, m_secure_monitor_manager));
+                    case PortIndex_Fs:
+                        return this->AcceptImpl(server, ObjectFactory::CreateSharedEmplaced<spl::impl::IFsInterface,     spl::FsService>(m_allocator, m_secure_monitor_manager));
+                    case PortIndex_Ssl:
+                        return this->AcceptImpl(server, ObjectFactory::CreateSharedEmplaced<spl::impl::ISslInterface,    spl::SslService>(m_allocator, m_secure_monitor_manager));
+                    case PortIndex_Es:
+                        return this->AcceptImpl(server, ObjectFactory::CreateSharedEmplaced<spl::impl::IEsInterface,     spl::EsService>(m_allocator, m_secure_monitor_manager));
+                    case PortIndex_Manu:
+                        return this->AcceptImpl(server, ObjectFactory::CreateSharedEmplaced<spl::impl::IManuInterface,   spl::ManuService>(m_allocator, m_secure_monitor_manager));
+                    AMS_UNREACHABLE_DEFAULT_CASE();
+                }
+            }
+
+            void SplMain() {
+                /* Setup server allocator. */
+                g_server_allocator.Attach(lmem::CreateExpHeap(g_server_allocator_buffer, sizeof(g_server_allocator_buffer), lmem::CreateOption_None));
+
+                /* Initialize secure monitor manager. */
+                g_secure_monitor_manager.Initialize();
+
+                g_use_new_server = hos::GetVersion() >= hos::Version_4_0_0;
+
+                /* Create services. */
+                const auto fw_ver = hos::GetVersion();
+                R_ABORT_UNLESS(g_server_manager.RegisterServer(PortIndex_General, GeneralServiceName, fw_ver >= hos::Version_4_0_0 ? GeneralMaxSessions : DeprecatedMaxSessions));
+                R_ABORT_UNLESS(g_server_manager.RegisterServer(PortIndex_Random, RandomServiceName, RandomMaxSessions));
+                if (fw_ver >= hos::Version_4_0_0) {
+                    R_ABORT_UNLESS(g_server_manager.RegisterServer(PortIndex_Crypto, CryptoServiceName, CryptoMaxSessions));
+                    R_ABORT_UNLESS(g_server_manager.RegisterServer(PortIndex_Fs,     FsServiceName,     FsMaxSessions));
+                    R_ABORT_UNLESS(g_server_manager.RegisterServer(PortIndex_Ssl,    SslServiceName,    SslMaxSessions));
+                    R_ABORT_UNLESS(g_server_manager.RegisterServer(PortIndex_Es,     EsServiceName,     EsMaxSessions));
+                    if (fw_ver >= hos::Version_5_0_0) {
+                        g_server_manager.RegisterServer(PortIndex_Manu, ManuServiceName, ManuMaxSessions);
+                    }
+                }
+
+                /* Loop forever, servicing our services. */
+                g_server_manager.LoopProcess();
+            }
+
         }
-    } else {
-        s_server_manager.AddWaitable(new ServiceServer<sts::spl::DeprecatedService>("spl:", 12));
+
     }
 
-    /* Loop forever, servicing our services. */
-    s_server_manager.Process();
+    namespace init {
 
-    return 0;
+        void InitializeSystemModule() {
+            /* Initialize our connection to sm. */
+            R_ABORT_UNLESS(sm::Initialize());
+        }
+
+        void FinalizeSystemModule() { /* ... */ }
+
+        void Startup() { /* ... */ }
+
+    }
+
+    void NORETURN Exit(int rc) {
+        AMS_UNUSED(rc);
+        AMS_ABORT("Exit called by immortal process");
+    }
+
+    void Main() {
+        /* Set thread name. */
+        os::SetThreadNamePointer(os::GetCurrentThread(), AMS_GET_SYSTEM_THREAD_NAME(spl, Main));
+        AMS_ASSERT(os::GetThreadPriority(os::GetCurrentThread()) == AMS_GET_SYSTEM_THREAD_PRIORITY(spl, Main));
+
+        /* Invoke SPL main. */
+        spl::SplMain();
+
+        /* This can never be reached. */
+        AMS_ASSUME(false);
+    }
+
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,29 +13,23 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
 #pragma once
-#include <switch.h>
 #include <stratosphere.hpp>
-#include <stratosphere/spl/spl_types.hpp>
+#include "spl_secure_monitor_manager.hpp"
 
-namespace sts::spl {
+namespace ams::spl {
 
-    class RandomService final : public IServiceObject {
+    class RandomService final {
         protected:
-            enum class CommandId {
-                GenerateRandomBytes = 0,
-            };
+            SecureMonitorManager &m_manager;
         public:
-            RandomService() { /* ... */ }
-            virtual ~RandomService() { /* ... */ }
-        private:
+            explicit RandomService(SecureMonitorManager *manager) : m_manager(*manager) { /* ... */ }
+        public:
             /* Actual commands. */
-            virtual Result GenerateRandomBytes(OutBuffer<u8> out);
-        public:
-            DEFINE_SERVICE_DISPATCH_TABLE {
-                MAKE_SERVICE_COMMAND_META(RandomService, GenerateRandomBytes),
-            };
+            Result GenerateRandomBytes(const sf::OutBuffer &out) {
+                return m_manager.GenerateRandomBytes(out.GetPointer(), out.GetSize());
+            }
     };
+    static_assert(spl::impl::IsIRandomInterface<RandomService>);
 
 }

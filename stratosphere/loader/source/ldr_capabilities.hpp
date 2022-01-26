@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,17 +13,16 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
 #pragma once
-#include <switch.h>
 #include <stratosphere.hpp>
-#include <stratosphere/ldr.hpp>
 
-namespace sts::ldr::caps {
+namespace ams::ldr {
 
-    /* Capabilities API. */
-    Result ValidateCapabilities(const void *acid_kac, size_t acid_kac_size, const void *aci_kac, size_t aci_kac_size);
-    u16    GetProgramInfoFlags(const void *kac, size_t kac_size);
-    void   SetProgramInfoFlags(u16 flags, void *kac, size_t kac_size);
+    Result TestCapability(const util::BitPack32 *kacd, size_t kacd_count, const util::BitPack32 *kac, size_t kac_count);
+
+    u16 MakeProgramInfoFlag(const util::BitPack32 *kac, size_t count);
+    void UpdateProgramInfoFlag(u16 flags, util::BitPack32 *kac, size_t count);
+
+    void PreProcessCapability(util::BitPack32 *kac, size_t count);
 
 }

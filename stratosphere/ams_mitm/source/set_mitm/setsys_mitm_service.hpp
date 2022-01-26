@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,53 +13,38 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
 #pragma once
-#include <switch.h>
 #include <stratosphere.hpp>
 
-#include "setsys_shim.h"
+#define AMS_SETTINGS_SYSTEM_MITM_INTERFACE_INFO(C, H)                                                                                                                                                                                               \
+    AMS_SF_METHOD_INFO(C, H,  3, Result, GetFirmwareVersion,       (sf::Out<ams::settings::FirmwareVersion> out),                                                                                                       (out))                      \
+    AMS_SF_METHOD_INFO(C, H,  4, Result, GetFirmwareVersion2,      (sf::Out<ams::settings::FirmwareVersion> out),                                                                                                       (out))                      \
+    AMS_SF_METHOD_INFO(C, H, 37, Result, GetSettingsItemValueSize, (sf::Out<u64> out_size, const ams::settings::SettingsName &name, const ams::settings::SettingsItemKey &key),                           (out_size, name, key))      \
+    AMS_SF_METHOD_INFO(C, H, 38, Result, GetSettingsItemValue,     (sf::Out<u64> out_size, const sf::OutBuffer &out, const ams::settings::SettingsName &name, const ams::settings::SettingsItemKey &key), (out_size, out, name, key)) \
+    AMS_SF_METHOD_INFO(C, H, 62, Result, GetDebugModeFlag,         (sf::Out<bool> out),                                                                                                                                 (out))
 
-class SetSysMitmService : public IMitmServiceObject {
-    private:
-        enum class CommandId {
-            GetFirmwareVersion       = 3,
-            GetFirmwareVersion2      = 4,
-            GetSettingsItemValueSize = 37,
-            GetSettingsItemValue     = 38,
+AMS_SF_DEFINE_MITM_INTERFACE(ams::mitm::settings, ISetSysMitmInterface, AMS_SETTINGS_SYSTEM_MITM_INTERFACE_INFO)
 
-            /* Commands for which set:sys *must* act as a passthrough. */
-            /* TODO: Solve the relevant IPC detection problem. */
-            GetEdid = 41,
-        };
-    public:
-        SetSysMitmService(std::shared_ptr<Service> s, u64 pid, sts::ncm::TitleId tid) : IMitmServiceObject(s, pid, tid) {
-            /* ... */
-        }
+namespace ams::mitm::settings {
 
-        static bool ShouldMitm(u64 pid, sts::ncm::TitleId tid) {
-            /* Mitm everything. */
-            return true;
-        }
+    class SetSysMitmService  : public sf::MitmServiceImplBase {
+        public:
+            using MitmServiceImplBase::MitmServiceImplBase;
+        public:
+            static bool ShouldMitm(const sm::MitmProcessInfo &client_info) {
+                /* We will mitm:
+                 * - everything, because we want to intercept all settings requests.
+                 */
+                AMS_UNUSED(client_info);
+                return true;
+            }
+        public:
+            Result GetFirmwareVersion(sf::Out<ams::settings::FirmwareVersion> out);
+            Result GetFirmwareVersion2(sf::Out<ams::settings::FirmwareVersion> out);
+            Result GetSettingsItemValueSize(sf::Out<u64> out_size, const ams::settings::SettingsName &name, const ams::settings::SettingsItemKey &key);
+            Result GetSettingsItemValue(sf::Out<u64> out_size, const sf::OutBuffer &out, const ams::settings::SettingsName &name, const ams::settings::SettingsItemKey &key);
+            Result GetDebugModeFlag(sf::Out<bool> out);
+    };
+    static_assert(IsISetSysMitmInterface<SetSysMitmService>);
 
-        static void PostProcess(IMitmServiceObject *obj, IpcResponseContext *ctx);
-
-    protected:
-        /* Overridden commands. */
-        Result GetFirmwareVersion(OutPointerWithServerSize<SetSysFirmwareVersion, 0x1> out);
-        Result GetFirmwareVersion2(OutPointerWithServerSize<SetSysFirmwareVersion, 0x1> out);
-        Result GetSettingsItemValueSize(Out<u64> out_size, InPointer<char> name, InPointer<char> key);
-        Result GetSettingsItemValue(Out<u64> out_size, OutBuffer<u8> out_value, InPointer<char> name, InPointer<char> key);
-
-        /* Forced passthrough commands. */
-        Result GetEdid(OutPointerWithServerSize<SetSysEdid, 0x1> out);
-    public:
-        DEFINE_SERVICE_DISPATCH_TABLE {
-            MAKE_SERVICE_COMMAND_META(SetSysMitmService, GetFirmwareVersion),
-            MAKE_SERVICE_COMMAND_META(SetSysMitmService, GetFirmwareVersion2),
-            MAKE_SERVICE_COMMAND_META(SetSysMitmService, GetSettingsItemValueSize),
-            MAKE_SERVICE_COMMAND_META(SetSysMitmService, GetSettingsItemValue),
-
-            MAKE_SERVICE_COMMAND_META(SetSysMitmService, GetEdid),
-        };
-};
+}

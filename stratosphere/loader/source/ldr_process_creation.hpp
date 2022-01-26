@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,18 +13,20 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
 #pragma once
-#include <switch.h>
-#include <stratosphere.hpp>
-#include <stratosphere/ldr.hpp>
+#include "ldr_argument_store.hpp"
 
-#include "ldr_arguments.hpp"
-
-namespace sts::ldr {
+namespace ams::ldr {
 
     /* Process Creation API. */
-    Result CreateProcess(Handle *out, PinId pin_id, const ncm::TitleLocation &loc, const char *path, u32 flags, Handle reslimit_h);
-    Result GetProgramInfo(ProgramInfo *out, const ncm::TitleLocation &loc);
+    Result CreateProcess(os::NativeHandle *out, PinId pin_id, const ncm::ProgramLocation &loc, const cfg::OverrideStatus &override_status, const char *path, const ArgumentStore::Entry *argument, u32 flags, os::NativeHandle resource_limit);
+    Result GetProgramInfo(ProgramInfo *out, cfg::OverrideStatus *out_status, const ncm::ProgramLocation &loc, const char *path);
+
+    Result PinProgram(PinId *out_id, const ncm::ProgramLocation &loc, const cfg::OverrideStatus &override_status);
+    Result UnpinProgram(PinId id);
+
+    Result GetProcessModuleInfo(u32 *out_count, ldr::ModuleInfo *out, size_t max_out_count, os::ProcessId process_id);
+
+    Result GetProgramLocationAndOverrideStatusFromPinId(ncm::ProgramLocation *out, cfg::OverrideStatus *out_status, PinId pin_id);
 
 }

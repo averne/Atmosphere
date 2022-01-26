@@ -1,8 +1,26 @@
 # Building Atmosphère
-The process for building Atmosphère is similar to building Fusée Gelée payloads and other Switch apps.
+Building Atmosphère is a very straightforward process that relies almost exclusively on tools provided by the [devkitPro](https://devkitpro.org) organization.
 
-In order to build Atmosphère you must have devkitARM and devkitA64 installed on your computer. You can find instructions on how to install and setup devkitARM and devkitA64 on various OSes [here](https://devkitpro.org/wiki/Getting_Started). You'll need to install the following packages via (dkp-)pacman: switch-dev switch-freetype devkitARM devkitarm-rules
+## Dependencies
++ [devkitA64](https://devkitpro.org)
++ [devkitARM](https://devkitpro.org)
++ [Python 2](https://www.python.org) (Python 3 may work as well, but this is not guaranteed)
++ [LZ4](https://pypi.org/project/lz4)
++ [PyCryptodome](https://pypi.org/project/pycryptodome) (optional)
++ [hactool](https://github.com/SciresM/hactool)
 
-sept requires you have python installed with the pycryptodome PyPi packages (`pip install pycryptodome`). You may also want to install the zip package from your package manager of choice to support the `make dist` recipe.
+## Instructions
+1. Follow the guide located [here](https://devkitpro.org/wiki/Getting_Started) to install and configure all the tools necessary for the build process.
 
-Once you have finished installing the devkitPro-provided toolchain/libraries, python, and the dependencies, simply clone the Atmosphère repo (clone with the -r flag), change your directory to it and run `make`.
+2. Install the following packages via (dkp-)pacman:
+    + `switch-dev`
+    + `switch-glm`
+    + `switch-libjpeg-turbo`
+    + `devkitARM`
+    + `devkitarm-rules`
+    + `hactool`
+
+3. Install the following library via python's package manager `pip`, required by [exosphere](components/exosphere.md):
+    + `lz4`
+
+4. Finally, clone the Atmosphère repository and run `make` under its root directory.

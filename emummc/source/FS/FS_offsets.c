@@ -41,6 +41,24 @@
 #include "offsets/800_exfat.h"
 #include "offsets/810.h"
 #include "offsets/810_exfat.h"
+#include "offsets/900.h"
+#include "offsets/900_exfat.h"
+#include "offsets/910.h"
+#include "offsets/910_exfat.h"
+#include "offsets/1000.h"
+#include "offsets/1000_exfat.h"
+#include "offsets/1020.h"
+#include "offsets/1020_exfat.h"
+#include "offsets/1100.h"
+#include "offsets/1100_exfat.h"
+#include "offsets/1200.h"
+#include "offsets/1200_exfat.h"
+#include "offsets/1203.h"
+#include "offsets/1203_exfat.h"
+#include "offsets/1300.h"
+#include "offsets/1300_exfat.h"
+#include "offsets/1310.h"
+#include "offsets/1310_exfat.h"
 #include "../utils/fatal.h"
 
 #define GET_OFFSET_STRUCT_NAME(vers) g_offsets##vers
@@ -61,6 +79,7 @@ static const fs_offsets_t GET_OFFSET_STRUCT_NAME(vers) = { \
     .nand_mutex                      = FS_OFFSET##vers##_NAND_MUTEX, \
     .active_partition                = FS_OFFSET##vers##_ACTIVE_PARTITION, \
     .sdmmc_das_handle                = FS_OFFSET##vers##_SDMMC_DAS_HANDLE, \
+    .sdmmc_accessor_controller_open  = FS_OFFSET##vers##_SDMMC_WRAPPER_CONTROLLER_OPEN, \
     .sdmmc_accessor_controller_close = FS_OFFSET##vers##_SDMMC_WRAPPER_CONTROLLER_CLOSE, \
     .sd_das_init                     = FS_OFFSET##vers##_SD_DAS_INIT, \
     .nintendo_paths                  = FS_OFFSET##vers##_NINTENDO_PATHS, \
@@ -92,6 +111,24 @@ DEFINE_OFFSET_STRUCT(_800);
 DEFINE_OFFSET_STRUCT(_800_EXFAT);
 DEFINE_OFFSET_STRUCT(_810);
 DEFINE_OFFSET_STRUCT(_810_EXFAT);
+DEFINE_OFFSET_STRUCT(_900);
+DEFINE_OFFSET_STRUCT(_900_EXFAT);
+DEFINE_OFFSET_STRUCT(_910);
+DEFINE_OFFSET_STRUCT(_910_EXFAT);
+DEFINE_OFFSET_STRUCT(_1000);
+DEFINE_OFFSET_STRUCT(_1000_EXFAT);
+DEFINE_OFFSET_STRUCT(_1020);
+DEFINE_OFFSET_STRUCT(_1020_EXFAT);
+DEFINE_OFFSET_STRUCT(_1100);
+DEFINE_OFFSET_STRUCT(_1100_EXFAT);
+DEFINE_OFFSET_STRUCT(_1200);
+DEFINE_OFFSET_STRUCT(_1200_EXFAT);
+DEFINE_OFFSET_STRUCT(_1203);
+DEFINE_OFFSET_STRUCT(_1203_EXFAT);
+DEFINE_OFFSET_STRUCT(_1300);
+DEFINE_OFFSET_STRUCT(_1300_EXFAT);
+DEFINE_OFFSET_STRUCT(_1310);
+DEFINE_OFFSET_STRUCT(_1310_EXFAT);
 
 const fs_offsets_t *get_fs_offsets(enum FS_VER version) {
     switch (version) {
@@ -145,6 +182,42 @@ const fs_offsets_t *get_fs_offsets(enum FS_VER version) {
             return &(GET_OFFSET_STRUCT_NAME(_810));
         case FS_VER_8_1_0_EXFAT:
             return &(GET_OFFSET_STRUCT_NAME(_810_EXFAT));
+        case FS_VER_9_0_0:
+            return &(GET_OFFSET_STRUCT_NAME(_900));
+        case FS_VER_9_0_0_EXFAT:
+            return &(GET_OFFSET_STRUCT_NAME(_900_EXFAT));
+        case FS_VER_9_1_0:
+            return &(GET_OFFSET_STRUCT_NAME(_910));
+        case FS_VER_9_1_0_EXFAT:
+            return &(GET_OFFSET_STRUCT_NAME(_910_EXFAT));
+        case FS_VER_10_0_0:
+            return &(GET_OFFSET_STRUCT_NAME(_1000));
+        case FS_VER_10_0_0_EXFAT:
+            return &(GET_OFFSET_STRUCT_NAME(_1000_EXFAT));
+        case FS_VER_10_2_0:
+            return &(GET_OFFSET_STRUCT_NAME(_1020));
+        case FS_VER_10_2_0_EXFAT:
+            return &(GET_OFFSET_STRUCT_NAME(_1020_EXFAT));
+        case FS_VER_11_0_0:
+            return &(GET_OFFSET_STRUCT_NAME(_1100));
+        case FS_VER_11_0_0_EXFAT:
+            return &(GET_OFFSET_STRUCT_NAME(_1100_EXFAT));
+        case FS_VER_12_0_0:
+            return &(GET_OFFSET_STRUCT_NAME(_1200));
+        case FS_VER_12_0_0_EXFAT:
+            return &(GET_OFFSET_STRUCT_NAME(_1200_EXFAT));
+        case FS_VER_12_0_3:
+            return &(GET_OFFSET_STRUCT_NAME(_1203));
+        case FS_VER_12_0_3_EXFAT:
+            return &(GET_OFFSET_STRUCT_NAME(_1203_EXFAT));
+        case FS_VER_13_0_0:
+            return &(GET_OFFSET_STRUCT_NAME(_1300));
+        case FS_VER_13_0_0_EXFAT:
+            return &(GET_OFFSET_STRUCT_NAME(_1300_EXFAT));
+        case FS_VER_13_1_0:
+            return &(GET_OFFSET_STRUCT_NAME(_1310));
+        case FS_VER_13_1_0_EXFAT:
+            return &(GET_OFFSET_STRUCT_NAME(_1310_EXFAT));
         default:
             fatal_abort(Fatal_UnknownVersion);
     }

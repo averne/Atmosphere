@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,92 +13,82 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <cstdlib>
-#include <cstdint>
-#include <cstring>
-#include <malloc.h>
-
-#include <switch.h>
-#include <atmosphere.h>
 #include <stratosphere.hpp>
+#include "amsmitm_initialization.hpp"
+#include "amsmitm_module_management.hpp"
+#include "bpc_mitm/bpc_ams_power_utils.hpp"
+#include "sysupdater/sysupdater_fs_utils.hpp"
 
-#include "amsmitm_modules.hpp"
-#include "utils.hpp"
+namespace ams {
 
-extern "C" {
-    extern u32 __start__;
+    namespace {
 
-    u32 __nx_applet_type = AppletType_None;
+        /* TODO: we really shouldn't be using malloc just to avoid dealing with real allocator separation. */
+        constexpr size_t MallocBufferSize = 16_MB;
+        alignas(os::MemoryPageSize) constinit u8 g_malloc_buffer[MallocBufferSize];
 
-    #define INNER_HEAP_SIZE 0x1000000
-    size_t nx_inner_heap_size = INNER_HEAP_SIZE;
-    char   nx_inner_heap[INNER_HEAP_SIZE];
+    }
 
-    void __libnx_initheap(void);
-    void __appInit(void);
-    void __appExit(void);
+    namespace init {
 
-    /* Exception handling. */
-    alignas(16) u8 __nx_exception_stack[0x1000];
-    u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
-    void __libnx_exception_handler(ThreadExceptionDump *ctx);
-    void __libstratosphere_exception_handler(AtmosphereFatalErrorContext *ctx);
+        void InitializeSystemModule() {
+            /* Initialize our connection to sm. */
+            R_ABORT_UNLESS(sm::Initialize());
+
+            /* Initialize fs. */
+            fs::InitializeForSystem();
+            fs::SetEnabledAutoAbort(false);
+
+            /* Initialize other services. */
+            R_ABORT_UNLESS(pmdmntInitialize());
+            R_ABORT_UNLESS(pminfoInitialize());
+            ncm::Initialize();
+            spl::InitializeForFs();
+
+            /* Verify that we can sanely execute. */
+            ams::CheckApiVersion();
+        }
+
+        void FinalizeSystemModule() { /* ... */ }
+
+        void Startup() {
+            /* Initialize the global malloc allocator. */
+            init::InitializeAllocator(g_malloc_buffer, sizeof(g_malloc_buffer));
+        }
+
+    }
+
+    void ExceptionHandler(FatalErrorContext *ctx) {
+        /* We're bpc-mitm (or ams_mitm, anyway), so manually reboot to fatal error. */
+        mitm::bpc::RebootForFatalError(ctx);
+    }
+
+    void NORETURN Exit(int rc) {
+        AMS_UNUSED(rc);
+        AMS_ABORT("Exit called by immortal process");
+    }
+
+    void Main() {
+        /* Register "ams" port, use up its session. */
+        {
+            svc::Handle ams_port;
+            R_ABORT_UNLESS(svc::ManageNamedPort(std::addressof(ams_port), "ams", 1));
+
+            svc::Handle ams_session;
+            R_ABORT_UNLESS(svc::ConnectToNamedPort(std::addressof(ams_session), "ams"));
+        }
+
+        /* Initialize fssystem library. */
+        fssystem::InitializeForFileSystemProxy();
+
+        /* Configure ncm to use fssystem library to mount content from the sd card. */
+        ncm::SetMountContentMetaFunction(mitm::sysupdater::MountSdCardContentMeta);
+
+        /* Launch all mitm modules in sequence. */
+        mitm::LaunchAllModules();
+
+        /* Wait for all mitm modules to end. */
+        mitm::WaitAllModules();
+    }
+
 }
-
-sts::ncm::TitleId __stratosphere_title_id = sts::ncm::TitleId::AtmosphereMitm;
-
-void __libnx_exception_handler(ThreadExceptionDump *ctx) {
-    StratosphereCrashHandler(ctx);
-}
-
-void __libstratosphere_exception_handler(AtmosphereFatalErrorContext *ctx) {
-    /* We're bpc-mitm (or ams_mitm, anyway), so manually reboot to fatal error. */
-    Utils::RebootToFatalError(ctx);
-}
-
-void __libnx_initheap(void) {
-	void*  addr = nx_inner_heap;
-	size_t size = nx_inner_heap_size;
-
-	/* Newlib */
-	extern char* fake_heap_start;
-	extern char* fake_heap_end;
-
-	fake_heap_start = (char*)addr;
-	fake_heap_end   = (char*)addr + size;
-}
-
-void __appInit(void) {
-    SetFirmwareVersionForLibnx();
-
-    DoWithSmSession([&]() {
-        R_ASSERT(fsInitialize());
-        R_ASSERT(pmdmntInitialize());
-        R_ASSERT(pminfoInitialize());
-    });
-
-    CheckAtmosphereVersion(CURRENT_ATMOSPHERE_VERSION);
-}
-
-void __appExit(void) {
-    /* Cleanup services. */
-    fsExit();
-}
-
-int main(int argc, char **argv)
-{
-    consoleDebugInit(debugDevice_SVC);
-    HosThread initializer_thread;
-
-    LaunchAllMitmModules();
-
-    R_ASSERT(initializer_thread.Initialize(&Utils::InitializeThreadFunc, NULL, 0x4000, 0x15));
-    R_ASSERT(initializer_thread.Start());
-
-    /* Wait for all mitm modules to end. */
-    WaitAllMitmModules();
-
-    return 0;
-}
-

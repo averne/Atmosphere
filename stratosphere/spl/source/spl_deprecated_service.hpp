@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,107 +13,133 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
 #pragma once
-#include <switch.h>
 #include <stratosphere.hpp>
-#include <stratosphere/spl/spl_types.hpp>
+#include "spl_secure_monitor_manager.hpp"
 
-namespace sts::spl {
+namespace ams::spl {
 
-    class DeprecatedService : public IServiceObject {
+    class DeprecatedService {
         protected:
-            enum class CommandId {
-                /* 1.0.0+ */
-                GetConfig                      = 0,
-                ExpMod                         = 1,
-                GenerateAesKek                 = 2,
-                LoadAesKey                     = 3,
-                GenerateAesKey                 = 4,
-                SetConfig                      = 5,
-                GenerateRandomBytes            = 7,
-                ImportLotusKey                 = 9,
-                DecryptLotusMessage            = 10,
-                IsDevelopment                  = 11,
-                GenerateSpecificAesKey         = 12,
-                DecryptRsaPrivateKeyDeprecated = 13,
-                DecryptRsaPrivateKey           = 13,
-                DecryptAesKey                  = 14,
-                CryptAesCtrDeprecated          = 15,
-                CryptAesCtr                    = 15,
-                ComputeCmac                    = 16,
-                ImportEsKey                    = 17,
-                UnwrapTitleKey                 = 18,
-                LoadTitleKey                   = 19,
-
-                /* 2.0.0+ */
-                UnwrapCommonTitleKey           = 20,
-                AllocateAesKeyslot             = 21,
-                FreeAesKeyslot                 = 22,
-                GetAesKeyslotAvailableEvent    = 23,
-
-                /* 3.0.0+ */
-                SetBootReason                  = 24,
-                GetBootReason                  = 25,
-            };
+            SecureMonitorManager &m_manager;
         public:
-            DeprecatedService() { /* ... */ }
-            virtual ~DeprecatedService() { /* ... */ }
-        protected:
+            explicit DeprecatedService(SecureMonitorManager *manager) : m_manager(*manager) { /* ... */ }
+        public:
+            virtual ~DeprecatedService() {
+                /* Free any keyslots this service is using. */
+                m_manager.DeallocateAesKeySlots(this);
+            }
+        public:
             /* Actual commands. */
-            virtual Result GetConfig(Out<u64> out, u32 which);
-            virtual Result ExpMod(OutPointerWithClientSize<u8> out, InPointer<u8> base, InPointer<u8> exp, InPointer<u8> mod);
-            virtual Result GenerateAesKek(Out<AccessKey> out_access_key, KeySource key_source, u32 generation, u32 option);
-            virtual Result LoadAesKey(u32 keyslot, AccessKey access_key, KeySource key_source);
-            virtual Result GenerateAesKey(Out<AesKey> out_key, AccessKey access_key, KeySource key_source);
-            virtual Result SetConfig(u32 which, u64 value);
-            virtual Result GenerateRandomBytes(OutPointerWithClientSize<u8> out);
-            virtual Result ImportLotusKey(InPointer<u8> src, AccessKey access_key, KeySource key_source, u32 option);
-            virtual Result DecryptLotusMessage(Out<u32> out_size, OutPointerWithClientSize<u8> out, InPointer<u8> base, InPointer<u8> mod, InPointer<u8> label_digest);
-            virtual Result IsDevelopment(Out<bool> is_dev);
-            virtual Result GenerateSpecificAesKey(Out<AesKey> out_key, KeySource key_source, u32 generation, u32 which);
-            virtual Result DecryptRsaPrivateKey(OutPointerWithClientSize<u8> dst, InPointer<u8> src, AccessKey access_key, KeySource key_source, u32 option);
-            virtual Result DecryptAesKey(Out<AesKey> out_key, KeySource key_source, u32 generation, u32 option);
-            virtual Result CryptAesCtrDeprecated(OutBuffer<u8> out_buf, u32 keyslot, InBuffer<u8> in_buf, IvCtr iv_ctr);
-            virtual Result CryptAesCtr(OutBuffer<u8, BufferType_Type1> out_buf, u32 keyslot, InBuffer<u8, BufferType_Type1> in_buf, IvCtr iv_ctr);
-            virtual Result ComputeCmac(Out<Cmac> out_cmac, u32 keyslot, InPointer<u8> in_buf);
-            virtual Result ImportEsKey(InPointer<u8> src, AccessKey access_key, KeySource key_source, u32 option);
-            virtual Result UnwrapTitleKey(Out<AccessKey> out_access_key, InPointer<u8> base, InPointer<u8> mod, InPointer<u8> label_digest, u32 generation);
-            virtual Result LoadTitleKey(u32 keyslot, AccessKey access_key);
-            virtual Result UnwrapCommonTitleKey(Out<AccessKey> out_access_key, KeySource key_source, u32 generation);
-            virtual Result AllocateAesKeyslot(Out<u32> out_keyslot);
-            virtual Result FreeAesKeyslot(u32 keyslot);
-            virtual void GetAesKeyslotAvailableEvent(Out<CopiedHandle> out_hnd);
-            virtual Result SetBootReason(BootReasonValue boot_reason);
-            virtual Result GetBootReason(Out<BootReasonValue> out);
-        public:
-            DEFINE_SERVICE_DISPATCH_TABLE {
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, GetConfig),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, ExpMod),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, GenerateAesKek),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, LoadAesKey),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, GenerateAesKey),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, SetConfig),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, GenerateRandomBytes),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, ImportLotusKey),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, DecryptLotusMessage),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, IsDevelopment),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, GenerateSpecificAesKey),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, DecryptRsaPrivateKey),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, DecryptAesKey),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, CryptAesCtrDeprecated,       FirmwareVersion_100, FirmwareVersion_100),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, CryptAesCtr,                 FirmwareVersion_200),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, ComputeCmac),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, ImportEsKey),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, UnwrapTitleKey),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, LoadTitleKey),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, UnwrapCommonTitleKey,        FirmwareVersion_200),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, AllocateAesKeyslot,          FirmwareVersion_200),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, FreeAesKeyslot,              FirmwareVersion_200),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, GetAesKeyslotAvailableEvent, FirmwareVersion_200),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, SetBootReason,               FirmwareVersion_300),
-                MAKE_SERVICE_COMMAND_META(DeprecatedService, GetBootReason,               FirmwareVersion_300),
-            };
+            Result GetConfig(sf::Out<u64> out, u32 which) {
+                return m_manager.GetConfig(out.GetPointer(), static_cast<spl::ConfigItem>(which));
+            }
+
+            Result ModularExponentiate(const sf::OutPointerBuffer &out, const sf::InPointerBuffer &base, const sf::InPointerBuffer &exp, const sf::InPointerBuffer &mod) {
+                return m_manager.ModularExponentiate(out.GetPointer(), out.GetSize(), base.GetPointer(), base.GetSize(), exp.GetPointer(), exp.GetSize(), mod.GetPointer(), mod.GetSize());
+            }
+
+            Result GenerateAesKek(sf::Out<AccessKey> out_access_key, KeySource key_source, u32 generation, u32 option) {
+                return m_manager.GenerateAesKek(out_access_key.GetPointer(), key_source, generation, option);
+            }
+
+            Result LoadAesKey(s32 keyslot, AccessKey access_key, KeySource key_source) {
+                return m_manager.LoadAesKey(keyslot, this, access_key, key_source);
+            }
+
+            Result GenerateAesKey(sf::Out<AesKey> out_key, AccessKey access_key, KeySource key_source) {
+                return m_manager.GenerateAesKey(out_key.GetPointer(), access_key, key_source);
+            }
+
+            Result SetConfig(u32 which, u64 value) {
+                return m_manager.SetConfig(static_cast<spl::ConfigItem>(which), value);
+            }
+
+            Result GenerateRandomBytes(const sf::OutPointerBuffer &out) {
+                return m_manager.GenerateRandomBytes(out.GetPointer(), out.GetSize());
+            }
+
+            Result DecryptAndStoreGcKey(const sf::InPointerBuffer &src, AccessKey access_key, KeySource key_source, u32 option) {
+                return m_manager.DecryptAndStoreGcKey(src.GetPointer(), src.GetSize(), access_key, key_source, option);
+            }
+
+            Result DecryptGcMessage(sf::Out<u32> out_size, const sf::OutPointerBuffer &out, const sf::InPointerBuffer &base, const sf::InPointerBuffer &mod, const sf::InPointerBuffer &label_digest) {
+                return m_manager.DecryptGcMessage(out_size.GetPointer(), out.GetPointer(), out.GetSize(), base.GetPointer(), base.GetSize(), mod.GetPointer(), mod.GetSize(), label_digest.GetPointer(), label_digest.GetSize());
+            }
+
+            Result IsDevelopment(sf::Out<bool> is_dev) {
+                return m_manager.IsDevelopment(is_dev.GetPointer());
+            }
+
+            Result GenerateSpecificAesKey(sf::Out<AesKey> out_key, KeySource key_source, u32 generation, u32 which) {
+                return m_manager.GenerateSpecificAesKey(out_key.GetPointer(), key_source, generation, which);
+            }
+
+            Result DecryptDeviceUniqueData(const sf::OutPointerBuffer &dst, const sf::InPointerBuffer &src, AccessKey access_key, KeySource key_source, u32 option) {
+                return m_manager.DecryptDeviceUniqueData(dst.GetPointer(), dst.GetSize(), src.GetPointer(), src.GetSize(), access_key, key_source, option);
+            }
+
+            Result DecryptAesKey(sf::Out<AesKey> out_key, KeySource key_source, u32 generation, u32 option) {
+                return m_manager.DecryptAesKey(out_key.GetPointer(), key_source, generation, option);
+            }
+
+            Result ComputeCtrDeprecated(const sf::OutBuffer &out_buf, s32 keyslot, const sf::InBuffer &in_buf, IvCtr iv_ctr) {
+                return m_manager.ComputeCtr(out_buf.GetPointer(), out_buf.GetSize(), keyslot, this, in_buf.GetPointer(), in_buf.GetSize(), iv_ctr);
+            }
+
+            Result ComputeCtr(const sf::OutNonSecureBuffer &out_buf, s32 keyslot, const sf::InNonSecureBuffer &in_buf, IvCtr iv_ctr) {
+                return m_manager.ComputeCtr(out_buf.GetPointer(), out_buf.GetSize(), keyslot, this, in_buf.GetPointer(), in_buf.GetSize(), iv_ctr);
+            }
+
+            Result ComputeCmac(sf::Out<Cmac> out_cmac, s32 keyslot, const sf::InPointerBuffer &in_buf) {
+                return m_manager.ComputeCmac(out_cmac.GetPointer(), keyslot, this, in_buf.GetPointer(), in_buf.GetSize());
+            }
+
+            Result LoadEsDeviceKey(const sf::InPointerBuffer &src, AccessKey access_key, KeySource key_source, u32 option) {
+                return m_manager.LoadEsDeviceKey(src.GetPointer(), src.GetSize(), access_key, key_source, option);
+            }
+
+            Result PrepareEsTitleKeyDeprecated(sf::Out<AccessKey> out_access_key, const sf::InPointerBuffer &base, const sf::InPointerBuffer &mod, const sf::InPointerBuffer &label_digest) {
+                return m_manager.PrepareEsTitleKey(out_access_key.GetPointer(), base.GetPointer(), base.GetSize(), mod.GetPointer(), mod.GetSize(), label_digest.GetPointer(), label_digest.GetSize(), 0);
+            }
+
+            Result PrepareEsTitleKey(sf::Out<AccessKey> out_access_key, const sf::InPointerBuffer &base, const sf::InPointerBuffer &mod, const sf::InPointerBuffer &label_digest, u32 generation) {
+                return m_manager.PrepareEsTitleKey(out_access_key.GetPointer(), base.GetPointer(), base.GetSize(), mod.GetPointer(), mod.GetSize(), label_digest.GetPointer(), label_digest.GetSize(), generation);
+            }
+
+            Result LoadPreparedAesKey(s32 keyslot, AccessKey access_key) {
+                return m_manager.LoadPreparedAesKey(keyslot, this, access_key);
+            }
+
+            Result PrepareCommonEsTitleKeyDeprecated(sf::Out<AccessKey> out_access_key, KeySource key_source) {
+                return m_manager.PrepareCommonEsTitleKey(out_access_key.GetPointer(), key_source, 0);
+            }
+
+            Result PrepareCommonEsTitleKey(sf::Out<AccessKey> out_access_key, KeySource key_source, u32 generation) {
+                return m_manager.PrepareCommonEsTitleKey(out_access_key.GetPointer(), key_source, generation);
+            }
+
+            Result AllocateAesKeySlot(sf::Out<s32> out_keyslot) {
+                return m_manager.AllocateAesKeySlot(out_keyslot.GetPointer(), this);
+            }
+
+            Result DeallocateAesKeySlot(s32 keyslot) {
+                return m_manager.DeallocateAesKeySlot(keyslot, this);
+            }
+
+            Result GetAesKeySlotAvailableEvent(sf::OutCopyHandle out_hnd) {
+                out_hnd.SetValue(m_manager.GetAesKeySlotAvailableEvent()->GetReadableHandle(), false);
+                return ResultSuccess();
+            }
+
+            Result SetBootReason(BootReasonValue boot_reason) {
+                return m_manager.SetBootReason(boot_reason);
+            }
+
+            Result GetBootReason(sf::Out<BootReasonValue> out) {
+                return m_manager.GetBootReason(out.GetPointer());
+            }
     };
+    static_assert(spl::impl::IsIDeprecatedGeneralInterface<DeprecatedService>);
 
 }

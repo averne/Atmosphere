@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,214 +13,223 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <cstdlib>
-#include <cstdint>
-#include <cstring>
-#include <malloc.h>
-
-#include <switch.h>
-#include <atmosphere.h>
 #include <stratosphere.hpp>
-#include <stratosphere/cfg.hpp>
-#include <stratosphere/sm/sm_manager_api.hpp>
-
 #include "pm_boot_mode_service.hpp"
 #include "pm_debug_monitor_service.hpp"
 #include "pm_info_service.hpp"
 #include "pm_shell_service.hpp"
-
 #include "impl/pm_process_manager.hpp"
 
-extern "C" {
-    extern u32 __start__;
+namespace ams {
 
-    u32 __nx_applet_type = AppletType_None;
+    namespace pm {
 
-    #define INNER_HEAP_SIZE 0x40000
-    size_t nx_inner_heap_size = INNER_HEAP_SIZE;
-    char   nx_inner_heap[INNER_HEAP_SIZE];
+        namespace {
 
-    void __libnx_initheap(void);
-    void __appInit(void);
-    void __appExit(void);
+            constexpr u32 PrivilegedFileAccessHeader[0x1C / sizeof(u32)]  = {0x00000001, 0x00000000, 0x80000000, 0x0000001C, 0x00000000, 0x0000001C, 0x00000000};
+            constexpr u32 PrivilegedFileAccessControl[0x2C / sizeof(u32)] = {0x00000001, 0x00000000, 0x80000000, 0x00000000, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF};
+            constexpr u8  PrivilegedServiceAccessControl[] = {0x80, '*', 0x00, '*'};
+            constexpr size_t ProcessCountMax = 0x40;
 
-    /* Exception handling. */
-    alignas(16) u8 __nx_exception_stack[0x1000];
-    u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
-    void __libnx_exception_handler(ThreadExceptionDump *ctx);
-    void __libstratosphere_exception_handler(AtmosphereFatalErrorContext *ctx);
-}
+            /* This uses debugging SVCs to retrieve a process's program id. */
+            ncm::ProgramId GetProcessProgramId(os::ProcessId process_id) {
+                /* Get a debug handle. */
+                svc::Handle debug_handle;
+                R_ABORT_UNLESS(svc::DebugActiveProcess(std::addressof(debug_handle), process_id.value));
+                ON_SCOPE_EXIT { R_ABORT_UNLESS(svc::CloseHandle(debug_handle)); };
 
-sts::ncm::TitleId __stratosphere_title_id = sts::ncm::TitleId::Pm;
-
-void __libnx_exception_handler(ThreadExceptionDump *ctx) {
-    StratosphereCrashHandler(ctx);
-}
-
-void __libnx_initheap(void) {
-    void*  addr = nx_inner_heap;
-    size_t size = nx_inner_heap_size;
-
-    /* Newlib */
-    extern char* fake_heap_start;
-    extern char* fake_heap_end;
-
-    fake_heap_start = (char*)addr;
-    fake_heap_end   = (char*)addr + size;
-}
-
-namespace {
-
-    constexpr u32 PrivilegedFileAccessHeader[0x1C / sizeof(u32)]  = {0x00000001, 0x00000000, 0x80000000, 0x0000001C, 0x00000000, 0x0000001C, 0x00000000};
-    constexpr u32 PrivilegedFileAccessControl[0x2C / sizeof(u32)] = {0x00000001, 0x00000000, 0x80000000, 0x00000000, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF};
-    constexpr u8  PrivilegedServiceAccessControl[] = {0x80, '*', 0x00, '*'};
-    constexpr size_t ProcessCountMax = 0x40;
-
-    /* TODO: Libstratosphere this stuff during fatal/creport rewrite. */
-    enum class DebugEventType : u32 {
-        AttachProcess = 0,
-        AttachThread = 1,
-        ExitProcess = 2,
-        ExitThread = 3,
-        Exception = 4
-    };
-
-    struct AttachProcessInfo {
-        sts::ncm::TitleId title_id;
-        u64 process_id;
-        char name[0xC];
-        u32 flags;
-        u64 user_exception_context_address; /* 5.0.0+ */
-    };
-
-    union DebugInfo {
-        AttachProcessInfo attach_process;
-    };
-
-    struct DebugEventInfo {
-        DebugEventType type;
-        u32 flags;
-        u64 thread_id;
-        union {
-            DebugInfo info;
-            u64 _[0x40/sizeof(u64)];
-        };
-    };
-
-    /* This uses debugging SVCs to retrieve a process's title id. */
-    sts::ncm::TitleId GetProcessTitleId(u64 process_id) {
-        /* Get a debug handle, or return our title id. */
-        AutoHandle debug_handle;
-        if (R_FAILED(svcDebugActiveProcess(debug_handle.GetPointer(), process_id))) {
-            u64 current_process_id = 0;
-            R_ASSERT(svcGetProcessId(&current_process_id, CUR_PROCESS_HANDLE));
-            if (current_process_id == process_id) {
-                return __stratosphere_title_id;
-            } else {
-                /* If we fail to debug a process other than our own, abort. */
-                std::abort();
+                /* Loop until we get the event that tells us about the process. */
+                svc::DebugEventInfo d;
+                while (true) {
+                    R_ABORT_UNLESS(svc::GetDebugEvent(std::addressof(d), debug_handle));
+                    if (d.type == svc::DebugEvent_CreateProcess) {
+                        return ncm::ProgramId{d.info.create_process.program_id};
+                    }
+                }
             }
+
+            /* This works around a bug fixed by FS in 4.0.0. */
+            /* Not doing so will cause KIPs with higher process IDs than 7 to be unable to use filesystem services. */
+            /* It also registers privileged processes with SM, so that their program ids can be known. */
+            void RegisterPrivilegedProcess(os::ProcessId process_id, ncm::ProgramId program_id) {
+                fsprUnregisterProgram(process_id.value);
+                fsprRegisterProgram(process_id.value, process_id.value, NcmStorageId_BuiltInSystem, PrivilegedFileAccessHeader, sizeof(PrivilegedFileAccessHeader), PrivilegedFileAccessControl, sizeof(PrivilegedFileAccessControl));
+                sm::manager::UnregisterProcess(process_id);
+                sm::manager::RegisterProcess(process_id, program_id, cfg::OverrideStatus{}, PrivilegedServiceAccessControl, sizeof(PrivilegedServiceAccessControl), PrivilegedServiceAccessControl, sizeof(PrivilegedServiceAccessControl));
+            }
+
+            void RegisterPrivilegedProcesses() {
+                /* Get privileged process range. */
+                os::ProcessId min_priv_process_id, max_priv_process_id;
+                R_ABORT_UNLESS(svc::GetSystemInfo(std::addressof(min_priv_process_id.value), svc::SystemInfoType_InitialProcessIdRange, svc::InvalidHandle, svc::InitialProcessIdRangeInfo_Minimum));
+                R_ABORT_UNLESS(svc::GetSystemInfo(std::addressof(max_priv_process_id.value), svc::SystemInfoType_InitialProcessIdRange, svc::InvalidHandle, svc::InitialProcessIdRangeInfo_Maximum));
+
+                /* Get current process id/program id. */
+                const auto cur_process_id = os::GetCurrentProcessId();
+                const auto cur_program_id = os::GetCurrentProgramId();
+
+                /* Get list of processes, register all privileged ones. */
+                s32 num_pids;
+                os::ProcessId pids[ProcessCountMax];
+                R_ABORT_UNLESS(svc::GetProcessList(std::addressof(num_pids), reinterpret_cast<u64 *>(pids), ProcessCountMax));
+                for (s32 i = 0; i < num_pids; i++) {
+                    if (min_priv_process_id <= pids[i] && pids[i] <= max_priv_process_id) {
+                        RegisterPrivilegedProcess(pids[i], pids[i] == cur_process_id ? cur_program_id : GetProcessProgramId(pids[i]));
+                    }
+                }
+            }
+
         }
 
-        /* Loop until we get the event that tells us about the process. */
-        DebugEventInfo d;
-        while (R_SUCCEEDED(svcGetDebugEvent(reinterpret_cast<u8 *>(&d), debug_handle.Get()))) {
-            if (d.type == DebugEventType::AttachProcess) {
-                return d.info.attach_process.title_id;
+        namespace {
+
+            /* pm:shell, pm:dmnt, pm:bm, pm:info. */
+            enum PortIndex {
+                PortIndex_Shell,
+                PortIndex_DebugMonitor,
+                PortIndex_BootMode,
+                PortIndex_Information,
+                PortIndex_Count,
+            };
+
+            using ServerOptions = sf::hipc::DefaultServerManagerOptions;
+
+            constexpr sm::ServiceName ShellServiceName = sm::ServiceName::Encode("pm:shell");
+            constexpr size_t          ShellMaxSessions = 8; /* Official maximum is 3. */
+
+            constexpr sm::ServiceName DebugMonitorServiceName = sm::ServiceName::Encode("pm:dmnt");
+            constexpr size_t          DebugMonitorMaxSessions = 16;
+
+            constexpr sm::ServiceName BootModeServiceName = sm::ServiceName::Encode("pm:bm");
+            constexpr size_t          BootModeMaxSessions = 8; /* Official maximum is 4. */
+
+            constexpr sm::ServiceName InformationServiceName = sm::ServiceName::Encode("pm:info");
+            constexpr size_t          InformationMaxSessions = 48 - (ShellMaxSessions + DebugMonitorMaxSessions + BootModeMaxSessions);
+
+            static_assert(InformationMaxSessions >= 16, "InformationMaxSessions");
+
+            constexpr size_t MaxSessions = ShellMaxSessions + DebugMonitorMaxSessions + BootModeMaxSessions + InformationMaxSessions;
+            static_assert(MaxSessions == 48, "MaxSessions");
+
+            class ServerManager final : public sf::hipc::ServerManager<PortIndex_Count, ServerOptions, MaxSessions> {
+                private:
+                    virtual ams::Result OnNeedsToAccept(int port_index, Server *server) override;
+            };
+
+            ServerManager g_server_manager;
+
+            /* NOTE: Nintendo only uses an unmanaged object for boot mode service, but no pm service has any class members/state, so we'll do it for all. */
+            sf::UnmanagedServiceObject<pm::impl::IShellInterface,           pm::ShellService> g_shell_service;
+            sf::UnmanagedServiceObject<pm::impl::IDeprecatedShellInterface, pm::ShellService> g_deprecated_shell_service;
+
+            sf::UnmanagedServiceObject<pm::impl::IDebugMonitorInterface,           pm::DebugMonitorService> g_dmnt_service;
+            sf::UnmanagedServiceObject<pm::impl::IDeprecatedDebugMonitorInterface, pm::DebugMonitorService> g_deprecated_dmnt_service;
+
+            sf::UnmanagedServiceObject<pm::impl::IBootModeInterface, pm::BootModeService>       g_boot_mode_service;
+            sf::UnmanagedServiceObject<pm::impl::IInformationInterface, pm::InformationService> g_information_service;
+
+            ams::Result ServerManager::OnNeedsToAccept(int port_index, Server *server) {
+                switch (port_index) {
+                    case PortIndex_Shell:
+                        if (hos::GetVersion() >= hos::Version_5_0_0) {
+                            return this->AcceptImpl(server, g_shell_service.GetShared());
+                        } else {
+                            return this->AcceptImpl(server, g_deprecated_shell_service.GetShared());
+                        }
+                    case PortIndex_DebugMonitor:
+                        if (hos::GetVersion() >= hos::Version_5_0_0) {
+                            return this->AcceptImpl(server, g_dmnt_service.GetShared());
+                        } else {
+                            return this->AcceptImpl(server, g_deprecated_dmnt_service.GetShared());
+                        }
+                    case PortIndex_BootMode:
+                        return this->AcceptImpl(server, g_boot_mode_service.GetShared());
+                    case PortIndex_Information:
+                        return this->AcceptImpl(server, g_information_service.GetShared());
+                    AMS_UNREACHABLE_DEFAULT_CASE();
+                }
             }
+
+            void RegisterServices() {
+                /* NOTE: Extra sessions have been added to pm:bm and pm:info to facilitate access by the rest of stratosphere. */
+                R_ABORT_UNLESS(g_server_manager.RegisterServer(PortIndex_Shell, ShellServiceName, ShellMaxSessions));
+                R_ABORT_UNLESS(g_server_manager.RegisterServer(PortIndex_DebugMonitor, DebugMonitorServiceName, DebugMonitorMaxSessions));
+                R_ABORT_UNLESS(g_server_manager.RegisterServer(PortIndex_BootMode, BootModeServiceName, BootModeMaxSessions));
+                R_ABORT_UNLESS(g_server_manager.RegisterServer(PortIndex_Information, InformationServiceName, InformationMaxSessions));
+            }
+
+            void LoopProcess() {
+                g_server_manager.LoopProcess();
+            }
+
         }
 
-        /* If we somehow didn't get the event, abort. */
-        std::abort();
     }
 
-    /* This works around a bug fixed by FS in 4.0.0. */
-    /* Not doing so will cause KIPs with higher process IDs than 7 to be unable to use filesystem services. */
-    /* It also registers privileged processes with SM, so that their title IDs can be known. */
-    void RegisterPrivilegedProcess(u64 process_id) {
-        fsprUnregisterProgram(process_id);
-        fsprRegisterProgram(process_id, process_id, FsStorageId_NandSystem, PrivilegedFileAccessHeader, sizeof(PrivilegedFileAccessHeader), PrivilegedFileAccessControl, sizeof(PrivilegedFileAccessControl));
-        sts::sm::manager::UnregisterProcess(process_id);
-        sts::sm::manager::RegisterProcess(process_id, GetProcessTitleId(process_id), PrivilegedServiceAccessControl, sizeof(PrivilegedServiceAccessControl), PrivilegedServiceAccessControl, sizeof(PrivilegedServiceAccessControl));
+    namespace hos {
+
+        void InitializeVersionInternal(bool allow_approximate);
+
     }
 
-    void RegisterPrivilegedProcesses() {
-        /* Get privileged process range. */
-        u64 min_priv_process_id = 0, max_priv_process_id = 0;
-        sts::cfg::GetInitialProcessRange(&min_priv_process_id, &max_priv_process_id);
+    namespace init {
 
-        /* Get list of processes, register all privileged ones. */
-        u32 num_pids;
-        u64 pids[ProcessCountMax];
-        R_ASSERT(svcGetProcessList(&num_pids, pids, ProcessCountMax));
-        for (size_t i = 0; i < num_pids; i++) {
-            if (min_priv_process_id <= pids[i] && pids[i] <= max_priv_process_id) {
-                RegisterPrivilegedProcess(pids[i]);
-            }
+        void InitializeSystemModule() {
+            /* Initialize our connection to sm. */
+            R_ABORT_UNLESS(sm::Initialize());
+
+            /* Initialize manager interfaces for fs and sm. */
+            R_ABORT_UNLESS(fsprInitialize());
+            R_ABORT_UNLESS(smManagerInitialize());
+
+            /* Work around a bug with process permissions on < 4.0.0. */
+            /* This registers all initial processes explicitly with both fs and sm. */
+            pm::RegisterPrivilegedProcesses();
+
+            /* Use our manager extension to tell SM that the FS bug has been worked around. */
+            R_ABORT_UNLESS(sm::manager::EndInitialDefers());
+
+            /* Wait for the true hos version to be available. */
+            hos::InitializeVersionInternal(false);
+
+            /* Now that the true hos version is available, we should once more end defers (alerting sm to the available hos version). */
+            R_ABORT_UNLESS(sm::manager::EndInitialDefers());
+
+            /* Initialize remaining services we need. */
+            R_ABORT_UNLESS(ldrPmInitialize());
+            spl::Initialize();
+
+            /* Verify that we can sanely execute. */
+            ams::CheckApiVersion();
         }
+
+        void FinalizeSystemModule() { /* ... */ }
+
+        void Startup() { /* ... */ }
+
+    }
+
+    void NORETURN Exit(int rc) {
+        AMS_UNUSED(rc);
+        AMS_ABORT("Exit called by immortal process");
+    }
+
+    void Main() {
+        /* Set thread name. */
+        os::SetThreadNamePointer(os::GetCurrentThread(), AMS_GET_SYSTEM_THREAD_NAME(pm, Main));
+        AMS_ASSERT(os::GetThreadPriority(os::GetCurrentThread()) == AMS_GET_SYSTEM_THREAD_PRIORITY(pm, Main));
+
+        /* Initialize process manager implementation. */
+        R_ABORT_UNLESS(pm::impl::InitializeProcessManager());
+
+        /* Create Services. */
+        pm::RegisterServices();
+
+        /* Loop forever, servicing our services. */
+        pm::LoopProcess();
+
+        /* This can never be reached. */
+        AMS_ASSUME(false);
     }
 
 }
-
-void __appInit(void) {
-    SetFirmwareVersionForLibnx();
-
-    DoWithSmSession([&]() {
-        R_ASSERT(fsprInitialize());
-        R_ASSERT(smManagerInitialize());
-
-        /* This works around a bug with process permissions on < 4.0.0. */
-        /* It also informs SM of privileged process information. */
-        RegisterPrivilegedProcesses();
-
-        /* Use AMS manager extension to tell SM that FS has been worked around. */
-        R_ASSERT(sts::sm::manager::EndInitialDefers());
-
-        R_ASSERT(lrInitialize());
-        R_ASSERT(ldrPmInitialize());
-        R_ASSERT(splInitialize());
-        R_ASSERT(fsInitialize());
-    });
-
-    CheckAtmosphereVersion(CURRENT_ATMOSPHERE_VERSION);
-}
-
-void __appExit(void) {
-    /* Cleanup services. */
-    fsdevUnmountAll();
-    fsExit();
-    splExit();
-    ldrPmExit();
-    lrExit();
-    smManagerExit();
-    fsprExit();
-}
-
-int main(int argc, char **argv)
-{
-    /* Initialize process manager implementation. */
-    R_ASSERT(sts::pm::impl::InitializeProcessManager());
-
-    /* Create Server Manager. */
-    static auto s_server_manager = WaitableManager(1);
-
-    /* Create Services. */
-    /* NOTE: Extra sessions have been added to pm:bm and pm:info to facilitate access by the rest of stratosphere. */
-    /* Also Note: PM was rewritten in 5.0.0, so the shell and dmnt services are different before/after. */
-    if (GetRuntimeFirmwareVersion() >= FirmwareVersion_500) {
-        s_server_manager.AddWaitable(new ServiceServer<sts::pm::shell::ShellService>("pm:shell", 3));
-        s_server_manager.AddWaitable(new ServiceServer<sts::pm::dmnt::DebugMonitorService>("pm:dmnt", 3));
-    } else {
-        s_server_manager.AddWaitable(new ServiceServer<sts::pm::shell::ShellServiceDeprecated>("pm:shell", 3));
-        s_server_manager.AddWaitable(new ServiceServer<sts::pm::dmnt::DebugMonitorServiceDeprecated>("pm:dmnt", 3));
-    }
-    s_server_manager.AddWaitable(new ServiceServer<sts::pm::bm::BootModeService>("pm:bm", 6));
-    s_server_manager.AddWaitable(new ServiceServer<sts::pm::info::InformationService>("pm:info", 19));
-
-    /* Loop forever, servicing our services. */
-    s_server_manager.Process();
-
-    return 0;
-}
-

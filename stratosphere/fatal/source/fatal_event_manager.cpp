@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,40 +13,32 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <switch.h>
-#include "fatal_types.hpp"
+#include <stratosphere.hpp>
 #include "fatal_event_manager.hpp"
 
-static FatalEventManager g_event_manager;
+namespace ams::fatal::srv {
 
-FatalEventManager *GetEventManager() {
-    return &g_event_manager;
-}
-
-FatalEventManager::FatalEventManager() {
-    /* Just create all the events. */
-    for (size_t i = 0; i < FatalEventManager::NumFatalEvents; i++) {
-        if (R_FAILED(eventCreate(&this->events[i], true))) {
-            std::abort();
+    FatalEventManager::FatalEventManager() : m_lock() {
+        /* Just create all the events. */
+        for (size_t i = 0; i < FatalEventManager::NumFatalEvents; i++) {
+            R_ABORT_UNLESS(os::CreateSystemEvent(std::addressof(m_events[i]), os::EventClearMode_AutoClear, true));
         }
     }
-}
 
-Result FatalEventManager::GetEvent(Handle *out) {
-    std::scoped_lock<HosMutex> lk{this->lock};
+    Result FatalEventManager::GetEvent(const os::SystemEventType **out) {
+        std::scoped_lock lk{m_lock};
 
-    /* Only allow GetEvent to succeed NumFatalEvents times. */
-    if (this->events_gotten >= FatalEventManager::NumFatalEvents) {
-        return ResultFatalTooManyEvents;
+        /* Only allow GetEvent to succeed NumFatalEvents times. */
+        R_UNLESS(m_num_events_gotten < FatalEventManager::NumFatalEvents, fatal::ResultTooManyEvents());
+
+        *out = std::addressof(m_events[m_num_events_gotten++]);
+        return ResultSuccess();
     }
 
-    *out = this->events[this->events_gotten++].revent;
-    return ResultSuccess;
-}
-
-void FatalEventManager::SignalEvents() {
-    for (size_t i = 0; i < FatalEventManager::NumFatalEvents; i++) {
-        eventFire(&this->events[i]);
+    void FatalEventManager::SignalEvents() {
+        for (size_t i = 0; i < FatalEventManager::NumFatalEvents; i++) {
+            os::SignalSystemEvent(std::addressof(m_events[i]));
+        }
     }
+
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,16 +13,14 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <stratosphere/sm/sm_manager_api.hpp>
-#include <stratosphere/ldr/ldr_pm_api.hpp>
-
+#include <stratosphere.hpp>
 #include "pm_process_info.hpp"
 
-namespace sts::pm::impl {
+namespace ams::pm::impl {
 
-    ProcessInfo::ProcessInfo(Handle h, u64 pid, ldr::PinId pin, const ncm::TitleLocation &l) : process_id(pid), pin_id(pin), loc(l), handle(h), state(ProcessState_Created), flags(0) {
-        /* ... */
+    ProcessInfo::ProcessInfo(os::NativeHandle h, os::ProcessId pid, ldr::PinId pin, const ncm::ProgramLocation &l, const cfg::OverrideStatus &s) : m_process_id(pid), m_pin_id(pin), m_loc(l), m_status(s), m_handle(h), m_state(svc::ProcessState_Created), m_flags(0) {
+        os::InitializeMultiWaitHolder(std::addressof(m_multi_wait_holder), m_handle);
+        os::SetMultiWaitHolderUserData(std::addressof(m_multi_wait_holder), reinterpret_cast<uintptr_t>(this));
     }
 
     ProcessInfo::~ProcessInfo() {
@@ -30,15 +28,18 @@ namespace sts::pm::impl {
     }
 
     void ProcessInfo::Cleanup() {
-        if (this->handle != INVALID_HANDLE) {
+        if (m_handle != os::InvalidNativeHandle) {
             /* Unregister the process. */
-            fsprUnregisterProgram(this->process_id);
-            sm::manager::UnregisterProcess(this->process_id);
-            ldr::pm::UnpinTitle(this->pin_id);
+            fsprUnregisterProgram(m_process_id.value);
+            sm::manager::UnregisterProcess(m_process_id);
+            ldr::pm::UnpinProgram(m_pin_id);
 
             /* Close the process's handle. */
-            svcCloseHandle(this->handle);
-            this->handle = INVALID_HANDLE;
+            os::CloseNativeHandle(m_handle);
+            m_handle = os::InvalidNativeHandle;
+
+            /* Unlink the process from its multi wait. */
+            os::UnlinkMultiWaitHolder(std::addressof(m_multi_wait_holder));
         }
     }
 

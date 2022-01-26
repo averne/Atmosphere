@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,92 +13,110 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <limits>
-#include "ldr_arguments.hpp"
+#include <stratosphere.hpp>
+#include "ldr_argument_store.hpp"
 #include "ldr_content_management.hpp"
-#include "ldr_ecs.hpp"
+#include "ldr_development_manager.hpp"
 #include "ldr_process_creation.hpp"
 #include "ldr_launch_record.hpp"
 #include "ldr_loader_service.hpp"
-#include "ldr_ro_manager.hpp"
 
-namespace sts::ldr {
+namespace ams::ldr {
 
-    /* Official commands. */
-    Result LoaderService::CreateProcess(Out<MovedHandle> proc_h, PinId id, u32 flags, CopiedHandle reslimit) {
-        AutoHandle reslimit_holder(reslimit.GetValue());
-        ncm::TitleLocation loc;
-        char path[FS_MAX_PATH];
+    namespace {
 
-        /* Get location. */
-        R_TRY(ldr::ro::GetTitleLocation(&loc, id));
+        constinit ArgumentStore g_argument_store;
 
-        if (loc.storage_id != static_cast<u8>(ncm::StorageId::None)) {
-            R_TRY(ResolveContentPath(path, loc));
-        }
-
-        return ldr::CreateProcess(proc_h.GetHandlePointer(), id, loc, path, flags, reslimit_holder.Get());
     }
 
-    Result LoaderService::GetProgramInfo(OutPointerWithServerSize<ProgramInfo, 0x1> out_program_info, ncm::TitleLocation loc) {
+
+    Result LoaderService::CreateProcess(os::NativeHandle *out, PinId pin_id, u32 flags, os::NativeHandle resource_limit) {
+        /* Declare program path, which we'll need later. */
+
+        /* Get the location and override status. */
+        ncm::ProgramLocation loc;
+        cfg::OverrideStatus override_status;
+        R_TRY(ldr::GetProgramLocationAndOverrideStatusFromPinId(std::addressof(loc), std::addressof(override_status), pin_id));
+
+        /* Get the program path. */
+        char path[fs::EntryNameLengthMax];
+        R_TRY(GetProgramPath(path, sizeof(path), loc));
+        path[sizeof(path) - 1] = '\x00';
+
+        /* Create the process. */
+        return ldr::CreateProcess(out, pin_id, loc, override_status, path, g_argument_store.Get(loc.program_id), flags, resource_limit);
+    }
+
+    Result LoaderService::GetProgramInfo(ProgramInfo *out, cfg::OverrideStatus *out_status, const ncm::ProgramLocation &loc) {
         /* Zero output. */
-        ProgramInfo *out = out_program_info.pointer;
         std::memset(out, 0, sizeof(*out));
 
-        R_TRY(ldr::GetProgramInfo(out, loc));
+        /* Get the program path. */
+        char path[fs::EntryNameLengthMax];
+        R_TRY(GetProgramPath(path, sizeof(path), loc));
+        path[sizeof(path) - 1] = '\x00';
 
-        if (loc.storage_id != static_cast<u8>(ncm::StorageId::None) && loc.title_id != out->title_id) {
-            char path[FS_MAX_PATH];
-            const ncm::TitleLocation new_loc = ncm::TitleLocation::Make(out->title_id, static_cast<ncm::StorageId>(loc.storage_id));
+        /* Get the program info. */
+        cfg::OverrideStatus status;
+        R_TRY(ldr::GetProgramInfo(out, std::addressof(status), loc, path));
 
-            R_TRY(ResolveContentPath(path, loc));
-            R_TRY(RedirectContentPath(path, new_loc));
+        if (loc.program_id != out->program_id) {
+            /* Redirect the program path. */
+            const ncm::ProgramLocation new_loc = ncm::ProgramLocation::Make(out->program_id, static_cast<ncm::StorageId>(loc.storage_id));
+            R_TRY(RedirectProgramPath(path, sizeof(path), new_loc));
 
-            const auto arg_info = args::Get(loc.title_id);
-            if (arg_info != nullptr) {
-                R_TRY(args::Set(new_loc.title_id, arg_info->args, arg_info->args_size));
+            /* Update the arguments, as needed. */
+            if (const auto *entry = g_argument_store.Get(loc.program_id); entry != nullptr) {
+                R_TRY(this->SetProgramArgument(new_loc.program_id, entry->argument, entry->argument_size));
             }
         }
 
-        return ResultSuccess;
-    }
-
-    Result LoaderService::PinTitle(Out<PinId> out_id, ncm::TitleLocation loc) {
-        return ldr::ro::PinTitle(out_id.GetPointer(), loc);
-    }
-
-    Result LoaderService::UnpinTitle(PinId id) {
-        return ldr::ro::UnpinTitle(id);
-    }
-
-    Result LoaderService::SetTitleArguments(ncm::TitleId title_id, InPointer<char> args, u32 args_size) {
-        return args::Set(title_id, args.pointer, std::min(args.num_elements, size_t(args_size)));
-    }
-
-    Result LoaderService::ClearArguments() {
-        return args::Clear();
-    }
-
-    Result LoaderService::GetProcessModuleInfo(Out<u32> count, OutPointerWithClientSize<ModuleInfo> out, u64 process_id) {
-        if (out.num_elements > std::numeric_limits<s32>::max()) {
-            return ResultLoaderInvalidSize;
+        /* If we should, set the output status. */
+        if (out_status != nullptr) {
+            *out_status = status;
         }
 
-        return ldr::ro::GetProcessModuleInfo(count.GetPointer(), out.pointer, out.num_elements, process_id);
+        return ResultSuccess();
     }
 
-    /* Atmosphere commands. */
-    Result LoaderService::AtmosphereSetExternalContentSource(Out<MovedHandle> out, ncm::TitleId title_id) {
-        return ecs::Set(out.GetHandlePointer(), title_id);
+    Result LoaderService::PinProgram(PinId *out, const ncm::ProgramLocation &loc, const cfg::OverrideStatus &status) {
+        *out = {};
+        return ldr::PinProgram(out, loc, status);
     }
 
-    void LoaderService::AtmosphereClearExternalContentSource(ncm::TitleId title_id) {
-        R_ASSERT(ecs::Clear(title_id));
+    Result LoaderService::UnpinProgram(PinId id) {
+        return ldr::UnpinProgram(id);
     }
 
-    void LoaderService::AtmosphereHasLaunchedTitle(Out<bool> out, ncm::TitleId title_id) {
-        out.SetValue(ldr::HasLaunchedTitle(title_id));
+    Result LoaderService::SetProgramArgument(ncm::ProgramId program_id, const void *argument, size_t size) {
+        return g_argument_store.Set(program_id, argument, size);
+    }
+
+    Result LoaderService::FlushArguments() {
+        return g_argument_store.Flush();
+    }
+
+    Result LoaderService::GetProcessModuleInfo(u32 *out_count, ModuleInfo *out, size_t max_out_count, os::ProcessId process_id) {
+        *out_count = 0;
+        std::memset(out, 0, max_out_count * sizeof(*out));
+        return ldr::GetProcessModuleInfo(out_count, out, max_out_count, process_id);
+    }
+
+    Result LoaderService::RegisterExternalCode(os::NativeHandle *out, ncm::ProgramId program_id) {
+        return fssystem::CreateExternalCode(out, program_id);
+    }
+
+    void LoaderService::UnregisterExternalCode(ncm::ProgramId program_id) {
+        fssystem::DestroyExternalCode(program_id);
+    }
+
+    void LoaderService::HasLaunchedBootProgram(bool *out, ncm::ProgramId program_id) {
+        *out = ldr::HasLaunchedBootProgram(program_id);
+    }
+
+    Result LoaderService::SetEnabledProgramVerification(bool enabled) {
+        ldr::SetEnabledProgramVerification(enabled);
+        return ResultSuccess();
     }
 
 }

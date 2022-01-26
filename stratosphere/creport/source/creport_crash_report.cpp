@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019 Atmosphère-NX
+ * Copyright (c) Atmosphère-NX
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -13,110 +13,192 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#include <cstdio>
-#include <cstring>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <switch.h>
-
+#include <stratosphere.hpp>
 #include "creport_crash_report.hpp"
-#include "creport_debug_types.hpp"
+#include "creport_utils.hpp"
 
-void CrashReport::BuildReport(u64 pid, bool has_extra_info) {
-    this->has_extra_info = has_extra_info;
-    if (OpenProcess(pid)) {
-        ProcessExceptions();
-        this->code_list.ReadCodeRegionsFromThreadInfo(this->debug_handle, &this->crashed_thread_info);
-        this->thread_list.ReadThreadsFromProcess(this->thread_tls_map, this->debug_handle, Is64Bit());
-        this->crashed_thread_info.SetCodeList(&this->code_list);
-        this->thread_list.SetCodeList(&this->code_list);
+namespace ams::creport {
 
-        if (IsApplication()) {
-            ProcessDyingMessage();
+    namespace {
+
+        /* Convenience definitions. */
+        constexpr size_t DyingMessageAddressOffset = 0x1C0;
+        static_assert(DyingMessageAddressOffset == AMS_OFFSETOF(ams::svc::aarch64::ProcessLocalRegion, dying_message_region_address));
+        static_assert(DyingMessageAddressOffset == AMS_OFFSETOF(ams::svc::aarch32::ProcessLocalRegion, dying_message_region_address));
+
+        /* Helper functions. */
+        bool TryGetCurrentTimestamp(u64 *out) {
+            /* Clear output. */
+            *out = 0;
+
+            /* Check if we have time service. */
+            {
+                bool has_time_service = false;
+                if (R_FAILED(sm::HasService(&has_time_service, sm::ServiceName::Encode("time:s"))) || !has_time_service) {
+                    return false;
+                }
+            }
+
+            /* Try to get the current time. */
+            {
+                if (R_FAILED(::timeInitialize())) {
+                    return false;
+                }
+                ON_SCOPE_EXIT { ::timeExit(); };
+
+                return R_SUCCEEDED(::timeGetCurrentTime(TimeType_LocalSystemClock, out));
+            }
         }
 
-        /* Real creport only does this if application, but there's no reason not to do it all the time. */
-        for (u32 i = 0; i < this->thread_list.GetThreadCount(); i++) {
-            this->code_list.ReadCodeRegionsFromThreadInfo(this->debug_handle, this->thread_list.GetThreadInfo(i));
+        void TryCreateReportDirectories() {
+            fs::EnsureDirectoryRecursively("sdmc:/atmosphere/crash_reports/dumps");
+            fs::EnsureDirectoryRecursively("sdmc:/atmosphere/fatal_reports/dumps");
         }
 
-        /* Real creport builds the report here. We do it later. */
+        constexpr const char *GetDebugExceptionString(const svc::DebugException type) {
+            switch (type) {
+                case svc::DebugException_UndefinedInstruction:
+                    return "Undefined Instruction";
+                case svc::DebugException_InstructionAbort:
+                    return "Instruction Abort";
+                case svc::DebugException_DataAbort:
+                    return "Data Abort";
+                case svc::DebugException_AlignmentFault:
+                    return "Alignment Fault";
+                case svc::DebugException_DebuggerAttached:
+                    return "Debugger Attached";
+                case svc::DebugException_BreakPoint:
+                    return "Break Point";
+                case svc::DebugException_UserBreak:
+                    return "User Break";
+                case svc::DebugException_DebuggerBreak:
+                    return "Debugger Break";
+                case svc::DebugException_UndefinedSystemCall:
+                    return "Undefined System Call";
+                case svc::DebugException_MemorySystemError:
+                    return "System Memory Error";
+                default:
+                    return "Unknown";
+            }
+        }
 
-        Close();
-    }
-}
-
-FatalContext *CrashReport::GetFatalContext() {
-    FatalContext *ctx = new FatalContext;
-    *ctx = (FatalContext){0};
-
-    ctx->is_aarch32 = false;
-    ctx->type = static_cast<u32>(this->exception_info.type);
-
-    for (size_t i = 0; i < 29; i++) {
-        ctx->aarch64_ctx.x[i] = this->crashed_thread_info.context.cpu_gprs[i].x;
-    }
-    ctx->aarch64_ctx.fp = this->crashed_thread_info.context.fp;
-    ctx->aarch64_ctx.lr = this->crashed_thread_info.context.lr;
-    ctx->aarch64_ctx.pc = this->crashed_thread_info.context.pc.x;
-
-    ctx->aarch64_ctx.stack_trace_size = this->crashed_thread_info.stack_trace_size;
-    for (size_t i = 0; i < ctx->aarch64_ctx.stack_trace_size; i++) {
-        ctx->aarch64_ctx.stack_trace[i] = this->crashed_thread_info.stack_trace[i];
-    }
-
-    if (this->code_list.code_count) {
-        ctx->aarch64_ctx.start_address = this->code_list.code_infos[0].start_address;
-    }
-
-    /* For ams fatal... */
-    ctx->aarch64_ctx.afsr0 = this->process_info.title_id;
-
-    return ctx;
-}
-
-void CrashReport::ProcessExceptions() {
-    if (!IsOpen()) {
-        return;
     }
 
-    DebugEventInfo d;
-    while (R_SUCCEEDED(svcGetDebugEvent((u8 *)&d, this->debug_handle))) {
-        switch (d.type) {
-            case DebugEventType::AttachProcess:
-                HandleAttachProcess(d);
-                break;
-            case DebugEventType::Exception:
-                HandleException(d);
-                break;
-            case DebugEventType::AttachThread:
-                HandleAttachThread(d);
-            case DebugEventType::ExitProcess:
-            case DebugEventType::ExitThread:
-            default:
-                break;
+    void CrashReport::Initialize() {
+        /* Initialize the heap. */
+        m_heap_handle = lmem::CreateExpHeap(m_heap_storage, sizeof(m_heap_storage), lmem::CreateOption_None);
+
+        /* Allocate members. */
+        m_module_list   = std::construct_at(static_cast<ModuleList *>(lmem::AllocateFromExpHeap(m_heap_handle, sizeof(ModuleList))));
+        m_thread_list   = std::construct_at(static_cast<ThreadList *>(lmem::AllocateFromExpHeap(m_heap_handle, sizeof(ThreadList))));
+        m_dying_message = static_cast<u8 *>(lmem::AllocateFromExpHeap(m_heap_handle, DyingMessageSizeMax));
+        if (m_dying_message != nullptr) {
+            std::memset(m_dying_message, 0, DyingMessageSizeMax);
         }
     }
 
-    /* Parse crashing thread info. */
-    this->crashed_thread_info.ReadFromProcess(this->thread_tls_map, this->debug_handle, this->crashed_thread_id, Is64Bit());
-}
+    void CrashReport::BuildReport(os::ProcessId process_id, bool has_extra_info) {
+        m_has_extra_info = has_extra_info;
 
-void CrashReport::HandleAttachProcess(DebugEventInfo &d) {
-    this->process_info = d.info.attach_process;
-    if ((GetRuntimeFirmwareVersion() >= FirmwareVersion_500) && IsApplication()) {
-        /* Parse out user data. */
-        u64 address = this->process_info.user_exception_context_address;
-        u64 userdata_address = 0;
-        u64 userdata_size = 0;
+        if (this->OpenProcess(process_id)) {
+            /* Parse info from the crashed process. */
+            this->ProcessExceptions();
+            m_module_list->FindModulesFromThreadInfo(m_debug_handle, m_crashed_thread, this->Is64Bit());
+            m_thread_list->ReadFromProcess(m_debug_handle, m_thread_tls_map, this->Is64Bit());
 
-        if (!IsAddressReadable(address, sizeof(userdata_address) + sizeof(userdata_size))) {
+            /* Associate module list to threads. */
+            m_crashed_thread.SetModuleList(m_module_list);
+            m_thread_list->SetModuleList(m_module_list);
+
+            /* Process dying message for applications. */
+            if (this->IsApplication()) {
+                this->ProcessDyingMessage();
+            }
+
+            /* Nintendo's creport finds extra modules by looking at all threads if application, */
+            /* but there's no reason for us not to always go looking. */
+            for (size_t i = 0; i < m_thread_list->GetThreadCount(); i++) {
+                m_module_list->FindModulesFromThreadInfo(m_debug_handle, m_thread_list->GetThreadInfo(i), this->Is64Bit());
+            }
+
+            /* Cache the module base address to send to fatal. */
+            if (m_module_list->GetModuleCount()) {
+                m_module_base_address = m_module_list->GetModuleStartAddress(0);
+            }
+
+            /* Nintendo's creport saves the report to erpt here, but we'll save to SD card later. */
+        }
+    }
+
+    void CrashReport::GetFatalContext(::FatalCpuContext *_out) const {
+        static_assert(sizeof(*_out) == sizeof(ams::fatal::CpuContext));
+        ams::fatal::CpuContext *out = reinterpret_cast<ams::fatal::CpuContext *>(_out);
+        std::memset(out, 0, sizeof(*out));
+
+        /* TODO: Support generating 32-bit fatal contexts? */
+        out->architecture = fatal::CpuContext::Architecture_Aarch64;
+        out->type = static_cast<u32>(m_exception_info.type);
+
+        for (size_t i = 0; i < fatal::aarch64::RegisterName_FP; i++) {
+            out->aarch64_ctx.SetRegisterValue(static_cast<fatal::aarch64::RegisterName>(i), m_crashed_thread.GetGeneralPurposeRegister(i));
+        }
+        out->aarch64_ctx.SetRegisterValue(fatal::aarch64::RegisterName_FP, m_crashed_thread.GetFP());
+        out->aarch64_ctx.SetRegisterValue(fatal::aarch64::RegisterName_LR, m_crashed_thread.GetLR());
+        out->aarch64_ctx.SetRegisterValue(fatal::aarch64::RegisterName_SP, m_crashed_thread.GetSP());
+        out->aarch64_ctx.SetRegisterValue(fatal::aarch64::RegisterName_PC, m_crashed_thread.GetPC());
+
+        out->aarch64_ctx.stack_trace_size = m_crashed_thread.GetStackTraceSize();
+        for (size_t i = 0; i < out->aarch64_ctx.stack_trace_size; i++) {
+            out->aarch64_ctx.stack_trace[i] = m_crashed_thread.GetStackTrace(i);
+        }
+
+        if (m_module_base_address != 0) {
+            out->aarch64_ctx.SetBaseAddress(m_module_base_address);
+        }
+
+        /* For ams fatal, which doesn't use afsr0, pass program_id instead. */
+        out->aarch64_ctx.SetProgramIdForAtmosphere(ncm::ProgramId{m_process_info.program_id});
+    }
+
+    void CrashReport::ProcessExceptions() {
+        /* Loop all debug events. */
+        svc::DebugEventInfo d;
+        while (R_SUCCEEDED(svc::GetDebugEvent(std::addressof(d), m_debug_handle))) {
+            switch (d.type) {
+                case svc::DebugEvent_CreateProcess:
+                    this->HandleDebugEventInfoCreateProcess(d);
+                    break;
+                case svc::DebugEvent_CreateThread:
+                    this->HandleDebugEventInfoCreateThread(d);
+                    break;
+                case svc::DebugEvent_Exception:
+                    this->HandleDebugEventInfoException(d);
+                    break;
+                case svc::DebugEvent_ExitProcess:
+                case svc::DebugEvent_ExitThread:
+                    break;
+            }
+        }
+
+        /* Parse crashed thread info. */
+        m_crashed_thread.ReadFromProcess(m_debug_handle, m_thread_tls_map, m_crashed_thread_id, this->Is64Bit());
+    }
+
+    void CrashReport::HandleDebugEventInfoCreateProcess(const svc::DebugEventInfo &d) {
+        m_process_info = d.info.create_process;
+
+        /* On 5.0.0+, we want to parse out a dying message from application crashes. */
+        if (hos::GetVersion() < hos::Version_5_0_0 || !IsApplication()) {
             return;
         }
 
+        /* Parse out user data. */
+        const u64 address = m_process_info.user_exception_context_address + DyingMessageAddressOffset;
+        u64 userdata_address = 0;
+        u64 userdata_size = 0;
+
         /* Read userdata address. */
-        if (R_FAILED(svcReadDebugProcessMemory(&userdata_address, this->debug_handle, address, sizeof(userdata_address)))) {
+        if (R_FAILED(svc::ReadDebugProcessMemory(reinterpret_cast<uintptr_t>(std::addressof(userdata_address)), m_debug_handle, address, sizeof(userdata_address)))) {
             return;
         }
 
@@ -126,279 +208,221 @@ void CrashReport::HandleAttachProcess(DebugEventInfo &d) {
         }
 
         /* Read userdata size. */
-        if (R_FAILED(svcReadDebugProcessMemory(&userdata_size, this->debug_handle, address + sizeof(userdata_address), sizeof(userdata_size)))) {
+        if (R_FAILED(svc::ReadDebugProcessMemory(reinterpret_cast<uintptr_t>(std::addressof(userdata_size)), m_debug_handle, address + sizeof(userdata_address), sizeof(userdata_size)))) {
             return;
         }
 
         /* Cap userdata size. */
-        if (userdata_size > sizeof(this->dying_message)) {
-            userdata_size = sizeof(this->dying_message);
+        userdata_size = std::min(size_t(userdata_size), DyingMessageSizeMax);
+
+        m_dying_message_address = userdata_address;
+        m_dying_message_size = userdata_size;
+    }
+
+    void CrashReport::HandleDebugEventInfoCreateThread(const svc::DebugEventInfo &d) {
+        /* Save info on the thread's TLS address for later. */
+        m_thread_tls_map.SetThreadTls(d.info.create_thread.thread_id, d.info.create_thread.tls_address);
+    }
+
+    void CrashReport::HandleDebugEventInfoException(const svc::DebugEventInfo &d) {
+        switch (d.info.exception.type) {
+            case svc::DebugException_UndefinedInstruction:
+                m_result = creport::ResultUndefinedInstruction();
+                break;
+            case svc::DebugException_InstructionAbort:
+                m_result = creport::ResultInstructionAbort();
+                break;
+            case svc::DebugException_DataAbort:
+                m_result = creport::ResultDataAbort();
+                break;
+            case svc::DebugException_AlignmentFault:
+                m_result = creport::ResultAlignmentFault();
+                break;
+            case svc::DebugException_UserBreak:
+                m_result = creport::ResultUserBreak();
+                /* Try to parse out the user break result. */
+                if (hos::GetVersion() >= hos::Version_5_0_0) {
+                    svc::ReadDebugProcessMemory(reinterpret_cast<uintptr_t>(std::addressof(m_result)), m_debug_handle, d.info.exception.specific.user_break.address, sizeof(m_result));
+                }
+                break;
+            case svc::DebugException_UndefinedSystemCall:
+                m_result = creport::ResultUndefinedSystemCall();
+                break;
+            case svc::DebugException_MemorySystemError:
+                m_result = creport::ResultMemorySystemError();
+                break;
+            case svc::DebugException_DebuggerAttached:
+            case svc::DebugException_BreakPoint:
+            case svc::DebugException_DebuggerBreak:
+                return;
         }
 
-        /* Assign. */
-        this->dying_message_address = userdata_address;
-        this->dying_message_size = userdata_size;
+        /* Save exception info. */
+        m_exception_info = d.info.exception;
+        m_crashed_thread_id = d.thread_id;
     }
-}
 
-void CrashReport::HandleException(DebugEventInfo &d) {
-    switch (d.info.exception.type) {
-        case DebugExceptionType::UndefinedInstruction:
-            this->result = ResultCreportUndefinedInstruction;
-            break;
-        case DebugExceptionType::InstructionAbort:
-            this->result = ResultCreportInstructionAbort;
-            d.info.exception.specific.raw = 0;
-            break;
-        case DebugExceptionType::DataAbort:
-            this->result = ResultCreportDataAbort;
-            break;
-        case DebugExceptionType::AlignmentFault:
-            this->result = ResultCreportAlignmentFault;
-            break;
-        case DebugExceptionType::UserBreak:
-            this->result = ResultCreportUserBreak;
-            /* Try to parse out the user break result. */
-            if ((GetRuntimeFirmwareVersion() >= FirmwareVersion_500)) {
-                Result user_result = 0;
-                if (IsAddressReadable(d.info.exception.specific.user_break.address, sizeof(user_result))) {
-                    svcReadDebugProcessMemory(&user_result, this->debug_handle, d.info.exception.specific.user_break.address, sizeof(user_result));
-                }
-                /* Only copy over the user result if it gives us information (as by default nnSdk uses the success code, which is confusing). */
-                if (R_FAILED(user_result)) {
-                    this->result = user_result;
-                }
-            }
-            break;
-        case DebugExceptionType::BadSvc:
-            this->result = ResultCreportBadSvc;
-            break;
-        case DebugExceptionType::SystemMemoryError:
-            this->result = ResultCreportSystemMemoryError;
-            d.info.exception.specific.raw = 0;
-            break;
-        case DebugExceptionType::DebuggerAttached:
-        case DebugExceptionType::BreakPoint:
-        case DebugExceptionType::DebuggerBreak:
-        default:
+    void CrashReport::ProcessDyingMessage() {
+        /* Dying message is only stored starting in 5.0.0. */
+        if (hos::GetVersion() < hos::Version_5_0_0) {
             return;
-    }
-    this->exception_info = d.info.exception;
-    this->crashed_thread_id = d.thread_id;
-}
+        }
 
-void CrashReport::HandleAttachThread(DebugEventInfo &d) {
-    this->thread_tls_map[d.info.attach_thread.thread_id] = d.info.attach_thread.tls_address;
-}
+        /* Validate address/size. */
+        if (m_dying_message_address == 0 || m_dying_message_address & 0xFFF) {
+            return;
+        }
+        if (m_dying_message_size > DyingMessageSizeMax) {
+            return;
+        }
 
-void CrashReport::ProcessDyingMessage() {
-    /* Dying message is only stored starting in 5.0.0. */
-    if ((GetRuntimeFirmwareVersion() < FirmwareVersion_500)) {
-        return;
-    }
+        /* Validate that the current report isn't garbage. */
+        if (!IsOpen() || !IsComplete()) {
+            return;
+        }
 
-    /* Validate the message address/size. */
-    if (this->dying_message_address == 0 || this->dying_message_address & 0xFFF) {
-        return;
-    }
-    if (this->dying_message_size > sizeof(this->dying_message)) {
-        return;
-    }
+        /* Verify that we have a dying message buffer. */
+        if (m_dying_message == nullptr) {
+            return;
+        }
 
-    /* Validate that the report isn't garbage. */
-    if (!IsOpen() || !WasSuccessful()) {
-        return;
+        /* Read the dying message. */
+        svc::ReadDebugProcessMemory(reinterpret_cast<uintptr_t>(m_dying_message), m_debug_handle, m_dying_message_address, m_dying_message_size);
     }
 
-    if (!IsAddressReadable(this->dying_message_address, this->dying_message_size)) {
-        return;
-    }
+    void CrashReport::SaveReport(bool enable_screenshot) {
+        /* Try to ensure path exists. */
+        TryCreateReportDirectories();
 
-    svcReadDebugProcessMemory(this->dying_message, this->debug_handle, this->dying_message_address, this->dying_message_size);
-}
+        /* Get a timestamp. */
+        u64 timestamp;
+        if (!TryGetCurrentTimestamp(&timestamp)) {
+            timestamp = os::GetSystemTick().GetInt64Value();
+        }
 
-bool CrashReport::IsAddressReadable(u64 address, u64 size, MemoryInfo *o_mi) {
-    MemoryInfo mi;
-    u32 pi;
+        /* Save files. */
+        {
+            char file_path[fs::EntryNameLengthMax + 1];
 
-    if (o_mi == NULL) {
-        o_mi = &mi;
-    }
-
-    if (R_FAILED(svcQueryDebugProcessMemory(o_mi, &pi, this->debug_handle, address))) {
-        return false;
-    }
-
-    /* Must be read or read-write */
-    if ((o_mi->perm | Perm_W) != Perm_Rw) {
-        return false;
-    }
-
-    /* Must have space for both userdata address and userdata size. */
-    if (address < o_mi->addr || o_mi->addr + o_mi->size < address + size) {
-        return false;
-    }
-
-    return true;
-}
-
-bool CrashReport::GetCurrentTime(u64 *out) {
-    *out = 0;
-
-    /* Verify that pcv isn't dead. */
-    {
-        bool has_time_service;
-        DoWithSmSession([&]() {
-            Handle dummy;
-            if (R_SUCCEEDED(smRegisterService(&dummy, "time:s", false, 0x20))) {
-                svcCloseHandle(dummy);
-                has_time_service = false;
-            } else {
-                has_time_service = true;
+            /* Save crash report. */
+            util::SNPrintf(file_path, sizeof(file_path), "sdmc:/atmosphere/crash_reports/%011lu_%016lx.log", timestamp, m_process_info.program_id);
+            {
+                ScopedFile file(file_path);
+                if (file.IsOpen()) {
+                    this->SaveToFile(file);
+                }
             }
-        });
-        if (!has_time_service) {
-            return false;
-        }
-    }
 
-    /* Try to get the current time. */
-    bool success = true;
-    DoWithSmSession([&]() {
-        success &= R_SUCCEEDED(timeInitialize());
-    });
-    if (success) {
-        success &= R_SUCCEEDED(timeGetCurrentTime(TimeType_LocalSystemClock, out));
-        timeExit();
-    }
-    return success;
-}
-
-void CrashReport::EnsureReportDirectories() {
-    char path[FS_MAX_PATH];
-    strcpy(path, "sdmc:/atmosphere");
-    mkdir(path, S_IRWXU);
-    strcat(path, "/crash_reports");
-    mkdir(path, S_IRWXU);
-    strcat(path, "/dumps");
-    mkdir(path, S_IRWXU);
-}
-
-void CrashReport::SaveReport() {
-    /* Save the report to the SD card. */
-    char report_path[FS_MAX_PATH];
-
-    /* Ensure path exists. */
-    EnsureReportDirectories();
-
-    /* Get a timestamp. */
-    u64 timestamp;
-    if (!GetCurrentTime(&timestamp)) {
-        timestamp = svcGetSystemTick();
-    }
-
-    /* Open report file. */
-    snprintf(report_path, sizeof(report_path) - 1, "sdmc:/atmosphere/crash_reports/%011lu_%016lx.log", timestamp, process_info.title_id);
-    FILE *f_report = fopen(report_path, "w");
-    if (f_report == NULL) {
-        return;
-    }
-    this->SaveToFile(f_report);
-    fclose(f_report);
-
-    /* Dump threads. */
-    snprintf(report_path, sizeof(report_path) - 1, "sdmc:/atmosphere/crash_reports/dumps/%011lu_%016lx_thread_info.bin", timestamp, process_info.title_id);
-    f_report = fopen(report_path, "wb");
-    this->thread_list.DumpBinary(f_report, this->crashed_thread_info.GetId());
-    fclose(f_report);
-}
-
-void CrashReport::SaveToFile(FILE *f_report) {
-    char buf[0x10] = {0};
-    fprintf(f_report, "Atmosphère Crash Report (v1.3):\n");
-    fprintf(f_report, "Result:                          0x%X (2%03d-%04d)\n\n", this->result, R_MODULE(this->result), R_DESCRIPTION(this->result));
-
-    /* Process Info. */
-    memcpy(buf, this->process_info.name, sizeof(this->process_info.name));
-    fprintf(f_report, "Process Info:\n");
-    fprintf(f_report, "    Process Name:                %s\n", buf);
-    fprintf(f_report, "    Title ID:                    %016lx\n", this->process_info.title_id);
-    fprintf(f_report, "    Process ID:                  %016lx\n", this->process_info.process_id);
-    fprintf(f_report, "    Process Flags:               %08x\n", this->process_info.flags);
-    if ((GetRuntimeFirmwareVersion() >= FirmwareVersion_500)) {
-        fprintf(f_report, "    User Exception Address:      %s\n", this->code_list.GetFormattedAddressString(this->process_info.user_exception_context_address));
-    }
-
-    fprintf(f_report, "Exception Info:\n");
-    fprintf(f_report, "    Type:                        %s\n", GetDebugExceptionTypeStr(this->exception_info.type));
-    fprintf(f_report, "    Address:                     %s\n", this->code_list.GetFormattedAddressString(this->exception_info.address));
-    switch (this->exception_info.type) {
-        case DebugExceptionType::UndefinedInstruction:
-            fprintf(f_report, "    Opcode:                      %08x\n", this->exception_info.specific.undefined_instruction.insn);
-            break;
-        case DebugExceptionType::DataAbort:
-        case DebugExceptionType::AlignmentFault:
-            if (this->exception_info.specific.raw != this->exception_info.address) {
-                fprintf(f_report, "    Fault Address:               %s\n", this->code_list.GetFormattedAddressString(this->exception_info.specific.raw));
+            /* Dump threads. */
+            util::SNPrintf(file_path, sizeof(file_path), "sdmc:/atmosphere/crash_reports/dumps/%011lu_%016lx_thread_info.bin", timestamp, m_process_info.program_id);
+            {
+                ScopedFile file(file_path);
+                if (file.IsOpen()) {
+                    m_thread_list->DumpBinary(file, m_crashed_thread.GetThreadId());
+                }
             }
-            break;
-        case DebugExceptionType::BadSvc:
-            fprintf(f_report, "    Svc Id:                      0x%02x\n", this->exception_info.specific.bad_svc.id);
-            break;
-        case DebugExceptionType::UserBreak:
-            fprintf(f_report, "    Break Reason:                0x%lx\n", this->exception_info.specific.user_break.break_reason);
-            fprintf(f_report, "    Break Address:               %s\n", this->code_list.GetFormattedAddressString(this->exception_info.specific.user_break.address));
-            fprintf(f_report, "    Break Size:                  0x%lx\n", this->exception_info.specific.user_break.size);
-            break;
-        default:
-            break;
-    }
 
-    fprintf(f_report, "Crashed Thread Info:\n");
-    this->crashed_thread_info.SaveToFile(f_report);
+            /* If we're open, we need to close here. */
+            if (this->IsOpen()) {
+                this->Close();
+            }
 
-    if ((GetRuntimeFirmwareVersion() >= FirmwareVersion_500)) {
-        if (this->dying_message_size) {
-            fprintf(f_report, "Dying Message Info:\n");
-            fprintf(f_report, "    Address:                     0x%s\n", this->code_list.GetFormattedAddressString(this->dying_message_address));
-            fprintf(f_report, "    Size:                        0x%016lx\n", this->dying_message_size);
-            CrashReport::Memdump(f_report, "    Dying Message:              ", this->dying_message, this->dying_message_size);
+            /* Finalize our heap. */
+            std::destroy_at(m_module_list);
+            std::destroy_at(m_thread_list);
+            lmem::FreeToExpHeap(m_heap_handle, m_module_list);
+            lmem::FreeToExpHeap(m_heap_handle, m_thread_list);
+            if (m_dying_message != nullptr) {
+                lmem::FreeToExpHeap(m_heap_handle, m_dying_message);
+            }
+            m_module_list   = nullptr;
+            m_thread_list   = nullptr;
+            m_dying_message = nullptr;
+
+            /* Try to take a screenshot. */
+            /* NOTE: Nintendo validates that enable_screenshot is true here, and validates that the application id is not in a blacklist. */
+            /* Since we save reports only locally and do not send them via telemetry, we will skip this. */
+            AMS_UNUSED(enable_screenshot);
+            if (hos::GetVersion() >= hos::Version_9_0_0 && this->IsApplication()) {
+                if (R_SUCCEEDED(capsrv::InitializeScreenShotControl())) {
+                    ON_SCOPE_EXIT { capsrv::FinalizeScreenShotControl(); };
+
+                    u64 jpeg_size;
+                    if (R_SUCCEEDED(capsrv::CaptureJpegScreenshot(std::addressof(jpeg_size), m_heap_storage, sizeof(m_heap_storage), vi::LayerStack_ApplicationForDebug, TimeSpan::FromSeconds(10)))) {
+                        util::SNPrintf(file_path, sizeof(file_path), "sdmc:/atmosphere/crash_reports/%011lu_%016lx.jpg", timestamp, m_process_info.program_id);
+                        ScopedFile file(file_path);
+                        if (file.IsOpen()) {
+                            file.Write(m_heap_storage, jpeg_size);
+                        }
+                    }
+                }
+            }
         }
     }
-    fprintf(f_report, "Code Region Info:\n");
-    this->code_list.SaveToFile(f_report);
-    fprintf(f_report, "\nThread Report:\n");
-    this->thread_list.SaveToFile(f_report);
-}
 
-/* Lifted from hactool. */
-void CrashReport::Memdump(FILE *f, const char *prefix, const void *data, size_t size) {
-    uint8_t *p = (uint8_t *)data;
+    void CrashReport::SaveToFile(ScopedFile &file) {
+        file.WriteFormat("Atmosphère Crash Report (v1.7):\n");
 
-    unsigned int prefix_len = strlen(prefix);
-    size_t offset = 0;
-    int first = 1;
+        file.WriteFormat("Result:                          0x%X (2%03d-%04d)\n\n", m_result.GetValue(), m_result.GetModule(), m_result.GetDescription());
 
-    while (size) {
-        unsigned int max = 32;
-
-        if (max > size) {
-            max = size;
+        /* Process Info. */
+        char name_buf[0x10] = {};
+        static_assert(sizeof(name_buf) >= sizeof(m_process_info.name), "buffer overflow!");
+        std::memcpy(name_buf, m_process_info.name, sizeof(m_process_info.name));
+        file.WriteFormat("Process Info:\n");
+        file.WriteFormat("    Process Name:                %s\n", name_buf);
+        file.WriteFormat("    Program ID:                  %016lx\n", m_process_info.program_id);
+        file.WriteFormat("    Process ID:                  %016lx\n", m_process_info.process_id);
+        file.WriteFormat("    Process Flags:               %08x\n", m_process_info.flags);
+        if (hos::GetVersion() >= hos::Version_5_0_0) {
+            file.WriteFormat("    User Exception Address:      %s\n", m_module_list->GetFormattedAddressString(m_process_info.user_exception_context_address));
         }
 
-        if (first) {
-            fprintf(f, "%s", prefix);
-            first = 0;
-        } else {
-            fprintf(f, "%*s", prefix_len, "");
+        /* Exception Info. */
+        file.WriteFormat("Exception Info:\n");
+        file.WriteFormat("    Type:                        %s\n", GetDebugExceptionString(m_exception_info.type));
+        file.WriteFormat("    Address:                     %s\n", m_module_list->GetFormattedAddressString(m_exception_info.address));
+        switch (m_exception_info.type) {
+            case svc::DebugException_UndefinedInstruction:
+                file.WriteFormat("    Opcode:                      %08x\n", m_exception_info.specific.undefined_instruction.insn);
+                break;
+            case svc::DebugException_DataAbort:
+            case svc::DebugException_AlignmentFault:
+                if (m_exception_info.specific.raw != m_exception_info.address) {
+                    file.WriteFormat("    Fault Address:               %s\n", m_module_list->GetFormattedAddressString(m_exception_info.specific.raw));
+                }
+                break;
+            case svc::DebugException_UndefinedSystemCall:
+                file.WriteFormat("    Svc Id:                      0x%02x\n", m_exception_info.specific.undefined_system_call.id);
+                break;
+            case svc::DebugException_UserBreak:
+                file.WriteFormat("    Break Reason:                0x%x\n", m_exception_info.specific.user_break.break_reason);
+                file.WriteFormat("    Break Address:               %s\n", m_module_list->GetFormattedAddressString(m_exception_info.specific.user_break.address));
+                file.WriteFormat("    Break Size:                  0x%lx\n", m_exception_info.specific.user_break.size);
+                break;
+            default:
+                break;
         }
 
-        for (unsigned int i = 0; i < max; i++) {
-            fprintf(f, "%02X", p[offset++]);
+        /* Crashed Thread Info. */
+        file.WriteFormat("Crashed Thread Info:\n");
+        m_crashed_thread.SaveToFile(file);
+
+        /* Dying Message. */
+        if (hos::GetVersion() >= hos::Version_5_0_0 && m_dying_message_size != 0) {
+            file.WriteFormat("Dying Message Info:\n");
+            file.WriteFormat("    Address:                     0x%s\n", m_module_list->GetFormattedAddressString(m_dying_message_address));
+            file.WriteFormat("    Size:                        0x%016lx\n", m_dying_message_size);
+            file.DumpMemory( "    Dying Message:               ", m_dying_message, m_dying_message_size);
         }
 
-        fprintf(f, "\n");
+        /* Module Info. */
+        file.WriteFormat("Module Info:\n");
+        m_module_list->SaveToFile(file);
 
-        size -= max;
+        /* Thread Info. */
+        file.WriteFormat("Thread Report:\n");
+        m_thread_list->SaveToFile(file);
     }
+
 }
